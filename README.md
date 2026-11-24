@@ -92,21 +92,19 @@ behind it. The watch half is yours to provide.
 You need the **Android SDK** (`minSdk 26`, `targetSdk 36`), **Go 1.26+**, and
 `gomobile` set up for `android/arm64`.
 
-**1. Build the Go bridge AAR** — from the Go module:
+**1. Build the Go bridge AAR** — with `gomobile` and `gobind` installed at the
+`golang.org/x/mobile` version named in `combined-go/go.mod`, and `ANDROID_NDK_HOME`
+pointing at an Android NDK:
 
 ```bash
-cd combined-go
-gomobile bind -target "android/arm64" -androidapi 26 -javapkg "fi.mirrormsg" \
-  -o out/mirrorbridge.aar \
-  fi.mirrormsg/mirrorbridge \
-  fi.mirrormsg/fbmessagebridge \
-  fi.mirrormsg/whatsappbridge \
-  fi.mirrormsg/telegrambridge \
-  fi.mirrormsg/discordbridge
+sh combined-go/bind.sh
 ```
 
-Then copy the result into the app: `combined-go/out/mirrorbridge.aar` →
-`app/libs/mirrorbridge.aar`.
+It binds every bridge package (`mirrorbridge`, `fbmessagebridge`, `whatsappbridge`,
+`telegrambridge`, `discordbridge`, `igbridge`, `signalbridge`, `xbridge`,
+`mediaroute`) into `combined-go/out/mirrorbridge.aar` and copies it to
+`app/libs/mirrorbridge.aar`. On Windows, run the `gomobile bind` command inside the
+script from `combined-go/` and copy the AAR yourself.
 
 **2. Telegram credentials.** The Telegram bridge needs your own `api_id` /
 `api_hash` from [my.telegram.org](https://my.telegram.org). Copy the template and

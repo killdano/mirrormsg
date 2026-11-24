@@ -1,0 +1,107 @@
+name: Build
+
+# Compile check: builds the Go bridges and the debug APK on every push to
+# main, testing and claude/ branches, and runs the unit tests. Nothing is
+# published from here. Failures are reported as check-run annotations.
+
+on:
+  push:
+    branches: ['main', 'testing', 'claude/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The bridge AAR is rebuilt only when the Go code changes.
+      - name: Cache the Go bridge
+        id: bridge
+        uses: actions/cache@v4
+        with:
+          path: app/libs/mirrorbridge.aar
+          key: bridge-v1-${{ hashFiles('combined-go/**', 'third_party/**') }}
+
+      - uses: actions/setup-go@v5
+        if: steps.bridge.outputs.cache-hit != 'true'
+        with:
+          go-version-file: combined-go/go.mod
+          cache-dependency-path: combined-go/go.sum
+
+      - name: Build the Go bridge
+        if: steps.bridge.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          V=$(sed -n 's/^[[:space:]]*golang.org\/x\/mobile \(v[^ ]*\).*/\1/p' combined-go/go.mod | head -1)
+          go install "golang.org/x/mobile/cmd/gomobile@$V" "golang.org/x/mobile/cmd/gobind@$V"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "x/mobile $V, NDK $ANDROID_NDK_HOME"
+          sh combined-go/bind.sh 2>&1 | tee bind.log
+          echo "::notice title=Go bridge::$(du -h app/libs/mirrorbridge.aar | cut -f1)"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee build.log
+
+      # Claude Code sessions can read check-run annotations but not Actions
+      # logs, so the errors are surfaced as an annotation.
+      - name: Report a failed build
+        if: failure()
+        run: |
+          python3 - <<'EOF'
+          import os
+          for name, title in (('bind.log', 'Go bridge build failed'), ('build.log', 'Gradle build failed')):
+              if not os.path.exists(name):
+                  continue
+              lines = open(name, errors='replace').read().splitlines()
+              errs = [l for l in lines if l.startswith('e: ')][:25]
+              if 'What went wrong:' in '\n'.join(lines):
+                  i = next(n for n, l in enumerate(lines) if 'What went wrong:' in l)
+                  errs += lines[i:i + 12]
+              if not errs:
+                  errs = lines[-40:]
+              msg = '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in errs)
+              print('::error title=%s::%s' % (title, msg))
+          EOF
+
+      - name: Unit tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew testDebugUnitTest 2>&1 | tee test.log
+
+      - name: Report failed tests
+        if: steps.tests.outcome == 'failure'
+        run: |
+          python3 - <<'EOF'
+          lines = open('test.log', errors='replace').read().splitlines()
+          hits = [l for l in lines if 'FAILED' in l or l.startswith('e: ')][:25] or lines[-30:]
+          msg = '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in hits)
+          print('::error title=Unit tests failed::' + msg)
+          EOF
+
+      - name: Size
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          echo "::notice title=Build::$(basename "$APK"), $(stat -c %s "$APK") bytes, tests ${{ steps.tests.outcome }}"

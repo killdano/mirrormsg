@@ -1,0 +1,47 @@
+name: Keep testing up to date
+
+# The testing branch holds the changes waiting to be tried, on top of main.
+# Whenever main changes, main is merged into testing here. A merge that
+# conflicts fails this run with an annotation; it is then merged by hand on
+# a claude/ branch and PR'd into testing.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-testing
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge main into testing
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git ls-remote --exit-code --heads origin testing >/dev/null; then
+            git push origin "origin/main:refs/heads/testing"
+            echo "::notice title=testing::created from main"; exit 0
+          fi
+          git checkout -B testing origin/testing
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "::notice title=testing::already has main"; exit 0
+          fi
+          if git merge --no-edit origin/main; then
+            git push origin testing
+            echo "::notice title=testing::merged main (${GITHUB_SHA:0:7})"
+          else
+            git merge --abort
+            echo "::error title=testing::merging main (${GITHUB_SHA:0:7}) into testing conflicts; merge it by hand on a claude/ branch and open a PR into testing"
+            exit 1
+          fi
