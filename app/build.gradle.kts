@@ -27,7 +27,10 @@ android {
     namespace = "com.dano.mirrormsg"
     sourceSets {
         getByName("main") {
+            // Both: AGP 9's built-in Kotlin compiles the kotlin directories,
+            // not extra java ones, so a .kt file here needs the kotlin entry.
             java.srcDir(extraSources ?: file("src/base/java"))
+            kotlin.srcDir(extraSources ?: file("src/base/java"))
         }
     }
     compileSdk {
