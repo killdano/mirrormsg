@@ -73,8 +73,8 @@ jobs:
           for name, title in (('bind.log', 'Go bridge build failed'), ('build.log', 'Gradle build failed')):
               if not os.path.exists(name):
                   continue
-              lines = open(name, errors='replace').read().splitlines()
-              errs = [l for l in lines if l.startswith('e: ')][:25]
+              lines = [l[:400] for l in open(name, errors='replace').read().splitlines()]
+              errs = [l for l in lines if l.startswith('e: ') or 'error:' in l][:25]
               if 'What went wrong:' in '\n'.join(lines):
                   i = next(n for n, l in enumerate(lines) if 'What went wrong:' in l)
                   errs += lines[i:i + 12]

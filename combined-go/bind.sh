@@ -6,9 +6,12 @@
 # golang.org/x/mobile version go.mod names, and an Android NDK
 # (ANDROID_NDK_HOME). Every package the app imports as fi.mirrormsg.<name>
 # must be listed here.
+#
+# -tags libsignal_go selects signalbridge's pure-Go libsignal backend; the
+# default one is cgo/Rust and doesn't link under gomobile.
 set -eu
 cd "$(dirname "$0")"
-gomobile bind -target "android/arm64" -androidapi 26 -javapkg "fi.mirrormsg" \
+gomobile bind -tags libsignal_go -target "android/arm64" -androidapi 26 -javapkg "fi.mirrormsg" \
   -o out/mirrorbridge.aar \
   fi.mirrormsg/mirrorbridge \
   fi.mirrormsg/fbmessagebridge \

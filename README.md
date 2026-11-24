@@ -102,9 +102,10 @@ sh combined-go/bind.sh
 
 It binds every bridge package (`mirrorbridge`, `fbmessagebridge`, `whatsappbridge`,
 `telegrambridge`, `discordbridge`, `igbridge`, `signalbridge`, `xbridge`,
-`mediaroute`) into `combined-go/out/mirrorbridge.aar` and copies it to
-`app/libs/mirrorbridge.aar`. On Windows, run the `gomobile bind` command inside the
-script from `combined-go/` and copy the AAR yourself.
+`mediaroute`) into `combined-go/out/mirrorbridge.aar`, with `-tags libsignal_go` (the
+pure-Go Signal backend), and copies it to `app/libs/mirrorbridge.aar`. On Windows,
+run the `gomobile bind` command inside the script from `combined-go/` and copy the
+AAR yourself.
 
 **2. Telegram credentials.** The Telegram bridge needs your own `api_id` /
 `api_hash` from [my.telegram.org](https://my.telegram.org). Copy the template and
