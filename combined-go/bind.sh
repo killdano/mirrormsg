@@ -11,6 +11,7 @@
 # default one is cgo/Rust and doesn't link under gomobile.
 set -eu
 cd "$(dirname "$0")"
+mkdir -p out
 gomobile bind -tags libsignal_go -target "android/arm64" -androidapi 26 -javapkg "fi.mirrormsg" \
   -o out/mirrorbridge.aar \
   fi.mirrormsg/mirrorbridge \
