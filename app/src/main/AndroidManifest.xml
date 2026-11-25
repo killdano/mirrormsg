@@ -64,6 +64,9 @@
              as a belt-and-suspenders alongside the package entry. -->
         <package android:name="com.beeper.android" />
         <provider android:authorities="com.beeper.api" />
+        <!-- MirrorMap Dash: the only caller of the Dash Cam picker and send service;
+             its signing certificate is checked (CamCallers). -->
+        <package android:name="com.mirrormap.dash" />
     </queries>
 
     <application
@@ -223,6 +226,30 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:label="Instagram Login" />
+
+        <!-- Dash Cam, for MirrorMap Dash: the chat picker (started for a result) and
+             the bound send service. Exported for Dash; both refuse any caller that
+             isn't Dash with a pinned signing certificate (CamCallers). -->
+        <activity
+            android:name=".CamPickActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:label="Dash Cam">
+            <intent-filter>
+                <action android:name="com.dano.mirrormsg.action.CAM_PICK_CHAT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".CamSendService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="com.dano.mirrormsg.action.CAM_SEND" />
+            </intent-filter>
+        </service>
 
     </application>
 </manifest>
