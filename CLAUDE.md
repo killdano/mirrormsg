@@ -26,4 +26,8 @@ Here, always:
 - Branches: `main` and `testing` (changes waiting to be tried, on top of
   main). `sync-testing.yml` merges main into testing whenever main moves.
 - Don't bump `versionCode` or `versionName`, and don't touch release
-  signing or `keystore.properties`.
+  signing or `keystore.properties`. Releases set the version and add a
+  "Release X.Y.0" commit and a `vX.Y.0` tag on `main`.
+- A change users would notice adds one plain-language line under
+  `## Unreleased` in `CHANGELOG.md` (no internal names, no message text,
+  names or numbers). Those lines become the store release notes.
