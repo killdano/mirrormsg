@@ -131,6 +131,12 @@ class CamRulesTest {
             CamRules.text(parse(fields("kind" to "public", "linkKind" to "live", "sport" to "run"))!!))
     }
 
+    @Test fun activityTakesAn() {
+        assertEquals(
+            "Ana is out on an activity. Watch my Dash Cam: https://mirrormap.app/cam/$token",
+            CamRules.text(parse(fields("sport" to "activity"))!!))
+    }
+
     @Test fun helpTemplate() {
         assertEquals(
             "Ana pressed Need help on Dash Cam. See where: https://mirrormap.app/cam/$token",

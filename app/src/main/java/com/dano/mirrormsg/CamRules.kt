@@ -110,10 +110,16 @@ object CamRules {
         KIND_HELP ->
             "${r.firstName} pressed Need help on Dash Cam. See where: https://mirrormap.app/cam/${r.token}"
         KIND_PUBLIC ->
-            "${r.firstName} is out on a ${r.sport}. Watch my Dash Cam: https://mirrormap.app/live/${r.token}"
+            "${r.firstName} is out on ${outing(r.sport)}. Watch my Dash Cam: https://mirrormap.app/live/${r.token}"
         else ->
-            "${r.firstName} is out on a ${r.sport}. Watch my Dash Cam: https://mirrormap.app/cam/${r.token}"
+            "${r.firstName} is out on ${outing(r.sport)}. Watch my Dash Cam: https://mirrormap.app/cam/${r.token}"
     }
+
+    /** "a ride", "a run", "an activity". */
+    private fun outing(sport: String): String =
+        if (sport.firstOrNull()?.lowercaseChar() in VOWELS) "an $sport" else "a $sport"
+
+    private val VOWELS = setOf('a', 'e', 'i', 'o', 'u')
 
     /** A picked chat's short, stable key (its network and id, hashed). */
     fun chatKey(serviceId: String, convoId: String): String {
