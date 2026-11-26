@@ -58,7 +58,11 @@ object CamRules {
     const val MAX_LIST_CHATS = 20
 
     private val SLOT = Regex("[A-Za-z0-9_-]{1,40}")
-    private val TOKEN = Regex("[A-Za-z0-9_-]{22}")
+    /**
+     * A link token: 22 random url-safe characters, or a word id, 3 or 4
+     * lowercase words of 3 to 8 letters joined by hyphens.
+     */
+    private val TOKEN = Regex("[A-Za-z0-9_-]{22}|[a-z]{3,8}(-[a-z]{3,8}){2,3}")
     private val ACT_ID = Regex("[A-Za-z0-9_-]{1,64}")
     private val FIRST_NAME = Regex("[\\p{L} '\\-]{1,20}")
     private val SPORTS = setOf("run", "ride", "walk", "hike", "activity")
