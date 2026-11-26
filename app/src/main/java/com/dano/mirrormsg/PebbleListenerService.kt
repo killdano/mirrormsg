@@ -740,6 +740,19 @@ class PebbleListenerService : BasePebbleListenerService() {
             scope.launch { leaveRoom(roomBack) }
             return ReceiveResult.Ack
         }
+        // Call (Calls.kt): picked in the watch's reply menu, for the chat on its screen. Its
+        // thread token must be the open chat's, so a stale request calls no one.
+        val reqCall = (data[Schema.KEY_REQ_CALL] as? PebbleDictionaryItem.Int32)?.value
+        if (reqCall != null) {
+            val convoId = Mirror.currentOpenConvoId
+            if (convoId == null || threadToken(convoId) != reqCall) {
+                LogStore.w(TAG, "Call for a chat that isn't the one open; ignored")
+            } else {
+                val svcId = Mirror.activeService()?.id
+                scope.launch { Calls.start(applicationContext, convoId, svcId) }
+            }
+            return ReceiveResult.Ack
+        }
         // Emoji actions (step 100): a feed's action (a like, a vote) on a message of the
         // chat on screen, picked at the top of the watch's reply menu.
         val reqAction = (data[Schema.KEY_REQ_ACTION] as? PebbleDictionaryItem.Int32)?.value
@@ -3304,6 +3317,10 @@ class PebbleListenerService : BasePebbleListenerService() {
                 if (acts.isNotEmpty())
                     frame[Schema.KEY_THREAD_ACTIONS] = PebbleDictionaryItem.Int32(actionsField(acts))
             }
+            // A chat Calls can call: a Call row in the watch's reply menu, on every frame.
+            if ((Mirror.watchCaps and Schema.IMGCAP_CALL) != 0 &&
+                Calls.target(convoId, Mirror.activeService()?.id) != null)
+                frame[Schema.KEY_THREAD_CALL] = PebbleDictionaryItem.Int32(1)
             // A reply room (step 99): how deep, on its every frame (and the feed's after a
             // Back); where the watch lands.
             if (roomNav || Rooms.isRoom(convoId))
