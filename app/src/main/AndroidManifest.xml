@@ -33,6 +33,15 @@
          (or Settings -> Apps -> MirrorMsg -> Display over other apps). -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- Calls from the watch (Calls.kt), off until switched on in Settings, which asks
+         for both: an ordinary phone call for a text chat (CALL_PHONE), and the contacts
+         entry WhatsApp, Signal or Telegram keeps for a person's voice call
+         (READ_CONTACTS, read on the phone only). CALL_PHONE would otherwise imply a
+         required telephony feature and hide the app from devices without one. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
     <!-- Beeper Content Provider (authority com.beeper.api): read chats/messages
          and send, via the Beeper Android app. Custom Beeper permissions, granted
          at runtime like POST_NOTIFICATIONS. -->
@@ -167,6 +176,19 @@
         <receiver
             android:name=".ReplyReceiver"
             android:exported="false" />
+
+        <!-- Calls from the watch: the calling notification's Hang up, and the invisible
+             trampoline that starts a network's call from that notification's Call. -->
+        <receiver
+            android:name=".CallReceiver"
+            android:exported="false" />
+        <activity
+            android:name=".CallActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
 
         <activity
             android:name=".QuickRepliesActivity"

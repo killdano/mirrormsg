@@ -455,6 +455,7 @@ object Mirror {
     fun loadSettings(ctx: Context) {
         val prefs = ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
         nightMode = prefs.getBoolean("nightMode", false)
+        watchCalls = prefs.getBoolean("watchCalls", false)
         emojiSubstitution = prefs.getBoolean("emojiSubstitution", false)
         EmojiSub.enabled = emojiSubstitution
         videoSoundLow = prefs.getBoolean("videoSoundLow", false)
@@ -635,6 +636,16 @@ object Mirror {
         quickReplies = if (clean.isEmpty()) DEFAULT_QUICK_REPLIES else clean
         ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
             .edit().putString("quickReplies", quickReplies.joinToString("\u001e")).apply()
+    }
+
+    // Calls from the watch (Calls.kt): a Call row on the watch for chats that can be
+    // called. Off until switched on in Settings (which asks for the permissions).
+    @Volatile var watchCalls: Boolean = false
+
+    fun setWatchCalls(ctx: Context, enabled: Boolean) {
+        watchCalls = enabled
+        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
+            .edit().putBoolean("watchCalls", enabled).apply()
     }
 
     fun setNightMode(ctx: Context, enabled: Boolean) {
@@ -837,6 +848,7 @@ object Schema {
                                      //   one item at a time in the detail view (step 88)
     const val IMGCAP_ROOMS = 8       //   reply rooms (step 99): a row's room (blob field
                                      //   12), KEY_REQ_ROOM / KEY_ROOM_BACK
+    const val IMGCAP_CALL = 16       //   calls: a Call row in its reply menu (KEY_THREAD_CALL)
     val KEY_GIF_TABLE: UInt = 113u   // phone->watch (GIF_START): per frame [u16 bytes]
                                      //   [u16 delay ms][u8 bit0 delta, bit1 comp]; then
                                      //   KEY_GIF_FRAME -1 chunks, KEY_IMG_SEQ = offset
@@ -1069,6 +1081,11 @@ object Schema {
                                         // each from the low end, how many in bits 12-15
     val KEY_REQ_ACTION: UInt      = 145u // watch->phone: action (v shr 16) on message
                                         // (v and 0xFFFF) of the chat on screen
+    // Calls from the watch (Calls.kt): a Call row in the watch's reply menu, under Emoji.
+    val KEY_THREAD_CALL: UInt     = 148u // phone->watch (every thread frame of a chat Calls
+                                        // can call, to a watch that says IMGCAP_CALL): 1
+    val KEY_REQ_CALL: UInt        = 149u // watch->phone: call the chat on screen; v = its
+                                        // thread token (a stale one calls no one)
     val KEY_THREAD_GREW: UInt     = 138u // phone->watch (OP_MSG of a feed, step 95): these rows
                                         // were fetched in the background and go below what
                                         // the watch holds, its view unmoved (KEY_LIST_ABS =
