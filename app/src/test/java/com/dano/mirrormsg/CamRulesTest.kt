@@ -79,6 +79,26 @@ class CamRulesTest {
         assertNull(parse(fields("token" to null)))
     }
 
+    @Test fun wordTokens() {
+        val person = "airplane-sandwich-river-candle"
+        val pub = "airplane-sandwich-river"
+        assertEquals(person, parse(fields("token" to person))!!.token)
+        assertEquals(pub, parse(fields("kind" to "public", "linkKind" to "live", "token" to pub))!!.token)
+        assertEquals(
+            "Ana is out on a ride. Watch my Dash Cam: https://mirrormap.app/cam/$person",
+            CamRules.text(parse(fields("token" to person))!!))
+        assertNull(parse(fields("token" to "airplane-sandwich")))
+        assertNull(parse(fields("token" to "airplane-sandwich-river-candle-otter")))
+        assertNull(parse(fields("token" to "Airplane-Sandwich-River")))
+        assertNull(parse(fields("token" to "airplane_sandwich_river")))
+        assertNull(parse(fields("token" to "airplane sandwich river")))
+        assertNull(parse(fields("token" to "ab-sandwich-river")))
+        assertNull(parse(fields("token" to "airplanes-sandwich-river")))
+        assertNull(parse(fields("token" to "airplane-sandwich-river/")))
+        assertNull(parse(fields("token" to "airplane-sandwich-river\n")))
+        assertFalse(parse(fields("token" to person))!!.toString().contains(person))
+    }
+
     @Test fun sportMustBeKnown() {
         for (s in listOf("run", "ride", "walk", "hike", "activity")) assertNotNull(s, parse(fields("sport" to s)))
         assertNull(parse(fields("sport" to "swim")))
