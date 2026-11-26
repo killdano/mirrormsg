@@ -849,6 +849,8 @@ object Schema {
     const val IMGCAP_ROOMS = 8       //   reply rooms (step 99): a row's room (blob field
                                      //   12), KEY_REQ_ROOM / KEY_ROOM_BACK
     const val IMGCAP_CALL = 16       //   calls: a Call row in its reply menu (KEY_THREAD_CALL)
+    const val IMGCAP_REACT = 32      //   reactions come only as KEY_REQ_REACT: an emoji in
+                                     //   a reply (KEY_REPLY_TEXT) is text, never a reaction
     val KEY_GIF_TABLE: UInt = 113u   // phone->watch (GIF_START): per frame [u16 bytes]
                                      //   [u16 delay ms][u8 bit0 delta, bit1 comp]; then
                                      //   KEY_GIF_FRAME -1 chunks, KEY_IMG_SEQ = offset
@@ -1086,6 +1088,11 @@ object Schema {
                                         // can call, to a watch that says IMGCAP_CALL): 1
     val KEY_REQ_CALL: UInt        = 149u // watch->phone: call the chat on screen; v = its
                                         // thread token (a stale one calls no one)
+    // Reactions from the watch's reply menu (its React row, and the emoji list it opens):
+    // asked for outright, so a reaction never goes as a message.
+    val KEY_REQ_REACT: UInt       = 150u // watch->phone (text): react with this emoji to
+                                        // message KEY_REPLY_TO_INDEX (with KEY_REQ_HASH) of
+                                        // the chat KEY_DRAFT_TOK names
     val KEY_THREAD_GREW: UInt     = 138u // phone->watch (OP_MSG of a feed, step 95): these rows
                                         // were fetched in the background and go below what
                                         // the watch holds, its view unmoved (KEY_LIST_ABS =

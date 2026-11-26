@@ -753,6 +753,21 @@ class PebbleListenerService : BasePebbleListenerService() {
             }
             return ReceiveResult.Ack
         }
+        // A reaction (the watch's React row, or the emoji list it opens): on a message of
+        // the chat on screen, named by its token, so one for a chat no longer open goes
+        // nowhere. Never sent as a message.
+        val reqReact = (data[Schema.KEY_REQ_REACT] as? PebbleDictionaryItem.Text)?.value
+        if (reqReact != null) {
+            val convoId = Mirror.currentOpenConvoId
+            val tok = (data[Schema.KEY_DRAFT_TOK] as? PebbleDictionaryItem.Int32)?.value
+            if (convoId == null || (tok != null && threadToken(convoId) != tok)) {
+                LogStore.w(TAG, "Reaction for a chat that isn't the one open; ignored")
+            } else {
+                val target = targetByHash((data[Schema.KEY_REPLY_TO_INDEX] as? PebbleDictionaryItem.Int32)?.value ?: -1, reqHash)
+                scope.launch { sendReaction(convoId, target, reqReact) }
+            }
+            return ReceiveResult.Ack
+        }
         // Emoji actions (step 100): a feed's action (a like, a vote) on a message of the
         // chat on screen, picked at the top of the watch's reply menu.
         val reqAction = (data[Schema.KEY_REQ_ACTION] as? PebbleDictionaryItem.Int32)?.value
@@ -1066,18 +1081,48 @@ class PebbleListenerService : BasePebbleListenerService() {
             // failed one stays failed, its own error in the log rather than the refusal.
             // In a reply room (step 99) one from the chat answers the post at its top. In
             // a feed an emoji is a reply too (step 100: its like is an action of its own).
+            // A watch that asks for reactions outright (IMGCAP_REACT) sends emoji picked
+            // to write as text: only an older one's emoji reply is a reaction.
             val target = if (targetIndex < 0) roomPostRow(convoId) else targetIndex
+            val reactOk = (Mirror.watchCaps and Schema.IMGCAP_REACT) == 0
             if (target >= 0) {
                 if (sendTargeted(convoId, target, text,
-                        allowReact = targetIndex >= 0 && !Mirror.isFeed(convoId))) return
+                        allowReact = reactOk && targetIndex >= 0 && !Mirror.isFeed(convoId))) return
                 if (Mirror.isFeed(convoId)) {
                     LogStore.w(TAG, "Feed reply not sent (a feed takes no plain messages)")
+                    WatchNotice.post(this, "Reply not sent", "This post didn't take the reply.")
                     return
                 }
             }
-            sendReplyInternal(convoId, route, text)
+            if (!sendReplyInternal(convoId, route, text))
+                WatchNotice.post(this, "Message not sent", "The network didn't take it. Try again from the watch.")
         } catch (e: Exception) {
             LogStore.e(TAG, "sendReply failed", e)
+        }
+    }
+
+    /**
+     * A reaction asked for outright (KEY_REQ_REACT): [emoji] on message [target] of the
+     * open chat, as a reaction only (the same one again takes it back, where the network
+     * can). One the network can't take says so on the watch, as a notification.
+     */
+    private suspend fun sendReaction(convoId: String, target: Int, emoji: String) {
+        try {
+            if (target < 0) {
+                LogStore.w(TAG, "Reaction with no message to go to; not sent")
+                return
+            }
+            val svc = Mirror.activeService()
+            if (svc == null || !svc.supportsReactionSend || !isEmojiOnly(emoji)) {
+                LogStore.w(TAG, "Reaction not sent (this chat's network takes none)")
+                WatchNotice.post(this, "Reaction not sent", "This chat doesn't take reactions.")
+                return
+            }
+            if (!sendTargeted(convoId, target, emoji, allowReact = true)) {
+                WatchNotice.post(this, "Reaction not sent", "The network didn't take it.")
+            }
+        } catch (e: Exception) {
+            LogStore.e(TAG, "sendReaction failed", e)
         }
     }
 
@@ -1400,6 +1445,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             LogStore.e(TAG, "sendDraft failed", e)
         }
         LogStore.w(TAG, "Draft not sent; kept (${text.length} chars)")
+        WatchNotice.post(this, "Message not sent", "Your draft is kept.")
         DraftStore.restore(this, convoId, text)
         pushDraft(convoId)
     }
