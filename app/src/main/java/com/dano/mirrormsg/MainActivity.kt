@@ -1,6 +1,7 @@
 package com.dano.mirrormsg
 
 import com.dano.mirrormsg.feedback.FeedbackFlavor
+import com.dano.mirrormsg.testbuild.TestBuilds
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
@@ -612,6 +613,21 @@ class MainActivity : Activity() {
         addDivider(iqCard, p)
         addDitherSection(iqCard, p)
         c.addView(iqCard)
+
+        // ---- TEST BUILDS --------------------------------------------------
+        // Test (debug) builds only (TestBuilds; release builds have no updater):
+        // install newer test builds by themselves. The detail line follows the
+        // updater: installed, newest, and what it's doing.
+        if (TestBuilds.available) {
+            sectionLabel(c, p, "Test builds")
+            val tbCard = card(p)
+            val detail = addToggleRow(tbCard, p, "Install new test builds automatically",
+                TestBuilds.detail(), TestBuilds.autoInstall) { on ->
+                TestBuilds.setAutoInstall(this, on)
+            }
+            TestBuilds.bindDetail(detail)
+            c.addView(tbCard)
+        }
     }
 
     // Dithering: a switch that reveals three sliders (edge protection, strength,
@@ -1464,8 +1480,9 @@ class MainActivity : Activity() {
             mix(Color.blue(over), Color.blue(under)))
     }
 
+    /** Returns the row's subtitle, for a row whose detail changes while it's shown. */
     private fun addToggleRow(parent: LinearLayout, p: Palette, title: String,
-                             sub: String, initial: Boolean, onChange: (Boolean) -> Unit) {
+                             sub: String, initial: Boolean, onChange: (Boolean) -> Unit): TextView {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1475,9 +1492,10 @@ class MainActivity : Activity() {
         txt.addView(TextView(this).apply {
             text = title; textSize = 16f; setTextColor(p.text)
         })
-        txt.addView(TextView(this).apply {
+        val subView = TextView(this).apply {
             text = sub; textSize = 13f; setTextColor(p.subtext)
-        })
+        }
+        txt.addView(subView)
         val sw = Switch(this).apply {
             isChecked = initial
             setOnCheckedChangeListener { _, c -> onChange(c) }
@@ -1486,6 +1504,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(sw)
         parent.addView(row)
+        return subView
     }
 
     // ---- Image quality helper rows ----------------------------------------
