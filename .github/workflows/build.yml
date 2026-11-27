@@ -61,7 +61,37 @@ jobs:
         run: |
           set -o pipefail
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee build.log
+          ./gradlew :app:assembleDebug :app:compileReleaseKotlin --stacktrace 2>&1 | tee build.log
+
+      # The Feedback screen (feedback/, kit/) is in debug builds only: the
+      # release build must not ask for the microphone or the install
+      # permissions, so Play's permission list stays as it is.
+      - name: Check the release permissions
+        run: |
+          set -o pipefail
+          ./gradlew :app:processReleaseMainManifest 2>&1 | tail -3
+          python3 - <<'EOF'
+          import glob, re, sys
+          def perms(variant):
+              hits = [p for p in glob.glob('app/build/intermediates/**/AndroidManifest.xml', recursive=True)
+                      if '/merged_manifest/' in p and '/%s/' % variant in p]
+              if not hits:
+                  return None
+              text = open(sorted(hits)[0]).read()
+              return sorted(set(re.findall(r'uses-permission[^>]*android:name="([^"]+)"', text)))
+          debug_only = {'android.permission.RECORD_AUDIO',
+                        'android.permission.REQUEST_INSTALL_PACKAGES',
+                        'android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION'}
+          rel = perms('release')
+          if rel is None:
+              print('::warning title=Release manifest::merged release manifest not found; permissions not checked')
+              sys.exit(0)
+          short = lambda ps: ', '.join(p.split('.')[-1] for p in ps)
+          print('::notice title=Release permissions::' + short(rel))
+          if debug_only & set(rel):
+              print('::error title=Release manifest::the release build would ask for ' + short(sorted(debug_only & set(rel))))
+              sys.exit(1)
+          EOF
 
       # Claude Code sessions can read check-run annotations but not Actions
       # logs, so the errors are surfaced as an annotation.

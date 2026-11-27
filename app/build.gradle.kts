@@ -115,6 +115,9 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
+    // The Feedback screen (feedback/, with mirrorapps-kit): test builds only.
+    // Release builds get none of it: no Compose, no microphone permission.
+    debugImplementation(project(":feedback"))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

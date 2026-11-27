@@ -1,5 +1,6 @@
 package com.dano.mirrormsg
 
+import com.dano.mirrormsg.feedback.FeedbackFlavor
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
@@ -400,9 +401,15 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(16), dp(16), dp(8))
         }
+        // Test builds add a 4th tab, Feedback, which opens its own screen
+        // (FeedbackFlavor; release builds don't have it). Four tabs get a
+        // smaller font and padding so they fit a narrow screen on one line.
+        val withFeedback = FeedbackFlavor.available
         fun tab(label: String, index: Int): TextView = TextView(this).apply {
-            text = label; textSize = 15f; gravity = Gravity.CENTER
-            setPadding(dp(12), dp(14), dp(12), dp(14))
+            text = label; textSize = if (withFeedback) 14f else 15f; gravity = Gravity.CENTER
+            val side = if (withFeedback) 4 else 12
+            setPadding(dp(side), dp(14), dp(side), dp(14))
+            if (withFeedback) isSingleLine = true
             val selected = activeTab == index
             setTextColor(if (selected) p.onAccent else p.text)
             background = rounded(if (selected) p.accent else p.card, 10,
@@ -412,14 +419,23 @@ class MainActivity : Activity() {
         val settingsTab = tab("Settings", 1)
         val accountsTab = tab("Networks", 0)
         val statusTab = tab("Status", 2)
+        val gap = if (withFeedback) 6 else 10
         tabRow.addView(accountsTab, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(10), 1))
+        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
         tabRow.addView(statusTab, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(10), 1))
+        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
         tabRow.addView(settingsTab, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (withFeedback) {
+            val feedbackTab = tab("Feedback", -1).apply {
+                setOnClickListener { FeedbackFlavor.open(this@MainActivity) }
+            }
+            tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
+            tabRow.addView(feedbackTab, LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
         root.addView(tabRow)
 
         // Tab content in a scroll view.
