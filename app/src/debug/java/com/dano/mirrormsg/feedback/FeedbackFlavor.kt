@@ -5,14 +5,16 @@ import android.content.Context
 import android.os.Build
 import com.dano.mirrormsg.LogStore
 import com.dano.mirrormsg.Vault
+import com.dano.mirrormsg.testbuild.TestBuilds
 import com.mirrorapps.kit.KitHost
 import com.mirrorapps.kit.KitLog
 
 /**
  * Debug (test) builds: the Feedback screen from the feedback module, set up
  * with MirrorMsg's log, its bug-report sections ([MsgBundle]) and the owner
- * code, which is sealed in the app's [Vault]. The release source set has a
- * no-op copy of this object.
+ * code, which is sealed in the app's [Vault]. The owner code is also the
+ * test-build updater's credential ([ownerCode], testbuild/TestBuilds.kt). The
+ * release source set has a no-op copy of this object.
  */
 internal object FeedbackFlavor {
     val available: Boolean = true
@@ -27,6 +29,15 @@ internal object FeedbackFlavor {
         } catch (t: Throwable) {
             LogStore.e(TAG, "Feedback: couldn't open", t)
         }
+    }
+
+    /**
+     * The owner code saved on the Feedback screen, or null. Read from the
+     * vault each time, so it works before the Feedback screen was ever opened.
+     */
+    fun ownerCode(context: Context): String? {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return Vault.getString(prefs, KEY_CODE).trim().ifEmpty { null }
     }
 
     private fun init(context: Context) {
@@ -45,7 +56,10 @@ internal object FeedbackFlavor {
                 log = MsgKitLog,
                 bundle = MsgBundle,
                 loadCode = { Vault.getString(prefs, KEY_CODE).ifEmpty { null } },
-                saveCode = { Vault.putString(prefs, KEY_CODE, it ?: "") },
+                saveCode = {
+                    Vault.putString(prefs, KEY_CODE, it ?: "")
+                    if (!it.isNullOrBlank()) TestBuilds.ownerCodeSet()
+                },
             ),
         )
         LogStore.i(TAG, "Feedback: kit set up")

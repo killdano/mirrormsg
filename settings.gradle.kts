@@ -33,3 +33,9 @@ include(":app")
 include(":feedback")
 include(":kit")
 project(":kit").projectDir = file("kit/kit")
+
+// The test-build updater from mirrorapps-kit (kit/updater/): test (debug)
+// builds install newer test builds by themselves. app/build.gradle.kts takes
+// it as debugImplementation, so release builds have none of it.
+include(":kit-updater")
+project(":kit-updater").projectDir = file("kit/updater")
