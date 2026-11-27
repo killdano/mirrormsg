@@ -82,6 +82,10 @@ android {
             }
         }
     }
+    buildFeatures {
+        // BuildConfig.DEBUG: which callers' certificates the Dash Cam hand-off accepts.
+        buildConfig = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

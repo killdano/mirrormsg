@@ -248,6 +248,13 @@ class MainActivity : Activity() {
      * or the thread would open under whichever account the watch happened to show).
      */
     private fun handleNotificationLaunch(launchIntent: Intent?) {
+        // A call from the watch couldn't start for want of a permission: its notification
+        // opens this to ask for them.
+        if (launchIntent?.getBooleanExtra(Calls.EXTRA_SETUP, false) == true) {
+            launchIntent.removeExtra(Calls.EXTRA_SETUP)
+            if (Mirror.watchCalls) requestCallPermissions()
+            return
+        }
         if (launchIntent?.getBooleanExtra(Notifier.EXTRA_FROM_NOTIF, false) != true) return
         val convoId = launchIntent.getStringExtra(Notifier.EXTRA_CONVO_ID) ?: return
         val owner = launchIntent.getStringExtra(Notifier.EXTRA_SERVICE_ID)
@@ -514,6 +521,14 @@ class MainActivity : Activity() {
             "Show unsupported emoji as a close supported one", Mirror.emojiSubstitution) { on ->
             Mirror.setEmojiSubstitution(this, on)
             pushConversationsToWatch()
+        }
+        addDivider(setCard, p)
+        // Calls from the watch (Calls.kt): a Call row in the watch's reply menu. Turning
+        // it on asks for the phone-call and contacts permissions.
+        addToggleRow(setCard, p, "Calls from the watch",
+            "Call a chat from the watch's reply menu. The call starts on this phone", Mirror.watchCalls) { on ->
+            Mirror.setWatchCalls(this, on)
+            if (on) requestCallPermissions()
         }
         if (Media.engine.playsVideo) {
             addDivider(setCard, p)
@@ -2158,6 +2173,19 @@ class MainActivity : Activity() {
         svc.startLogin(this)
     }
 
+    /** Both permissions Calls from the watch asks for are granted. */
+    private fun hasCallPermissions(): Boolean = Calls.PERMISSIONS.all {
+        checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    /** Ask for whichever of Calls from the watch's permissions are missing. */
+    private fun requestCallPermissions() {
+        val missing = Calls.PERMISSIONS.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 9010)
+    }
+
     /** True when the Beeper app is installed (visible via the manifest <queries>). */
     private fun isBeeperInstalled(): Boolean =
         try { packageManager.getPackageInfo("com.beeper.android", 0); true }
@@ -2213,6 +2241,33 @@ class MainActivity : Activity() {
             isBatteryUnrestricted(),
             "Keeps MirrorMsg running so messages arrive reliably") {
             requestBatteryUnrestricted()
+        }
+        // Calls from the watch, while it's on: the permissions it asks for, "Display over
+        // other apps" (a WhatsApp, Signal or Telegram call starts in one press; without it
+        // the watch shows a Call button to press), and notification access (Hang up from
+        // the watch; shown below with Beeper's when Beeper is installed).
+        if (Mirror.watchCalls) {
+            addDivider(permCard, p)
+            addCheckRow(permCard, p, "Phone calls and contacts", hasCallPermissions(),
+                "Lets the watch start calls on this phone") {
+                requestCallPermissions()
+            }
+            addDivider(permCard, p)
+            addCheckRow(permCard, p, "Display over other apps", Settings.canDrawOverlays(this),
+                "Starts WhatsApp, Signal and Telegram calls from the watch in one press") {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:$packageName")))
+                } catch (e: Exception) { LogStore.e(TAG, "Overlay settings didn't open", e) }
+            }
+            if (!isBeeperInstalled()) {
+                addDivider(permCard, p)
+                addCheckRow(permCard, p, "Notification access",
+                    hasNotificationListenerAccess(),
+                    "Lets you hang up from the watch") {
+                    openNotificationListenerSettings()
+                }
+            }
         }
         // Beeper-specific permissions grouped together at the BOTTOM, and shown ONLY
         // when the Beeper app is installed. Both are only meaningful with Beeper:
