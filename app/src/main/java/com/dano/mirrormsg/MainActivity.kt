@@ -14,6 +14,7 @@ import android.widget.Switch
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.LinearLayout
 import android.text.InputType
 import android.widget.EditText
@@ -85,6 +86,19 @@ class MainActivity : Activity() {
             "https://messages.google.com",
             "https://www.google.com"
         )
+
+        // A Gaia pairing request lives 300 s on Google's side (libgm sends it with
+        // that TTL). Google normally answers "timed out" itself; when no answer comes
+        // at all (the connection dropped while the phone slept), the confirm screen
+        // gives the emoji up this long after it appeared.
+        private const val PAIR_EXPIRE_MS = 330_000L
+
+        // The pairing screens.
+        private const val PAIR_NONE = 0
+        private const val PAIR_STARTING = 1   // asking Google for an emoji
+        private const val PAIR_CONFIRM = 2    // the emoji, to tap in Google Messages
+        private const val PAIR_EXPIRED = 3    // the emoji ran out before it was tapped
+        private const val PAIR_FAILED = 4     // Google said no, or the attempt broke
     }
 
     private val sink = object : EventSink {
@@ -93,7 +107,7 @@ class MainActivity : Activity() {
                 "PAIR_EMOJI" -> {
                     LogStore.w(TAG, ">>> Confirm THIS emoji on your phone: $jsonPayload")
                     val emoji = try { JSONObject(jsonPayload).optString("emoji") } catch (e: Exception) { "" }
-                    runOnUiThread { showPairingEmoji(emoji) }
+                    runOnUiThread { onPairingEmoji(emoji) }
                 }
                 "MESSAGE"      -> {
                     LogStore.i(TAG, "MESSAGE $jsonPayload")
@@ -232,14 +246,40 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
+        // Back (from Google Messages, or anywhere) to a pairing that ran out while the
+        // app was away: its emoji is no longer in Google Messages, so start a new
+        // pairing at once rather than leave the dead one up.
+        if (checkPairingExpiry() || pairRestartOnResume) {
+            pairRestartOnResume = false
+            LogStore.i(TAG, "Pairing ran out while the app was away; starting over.")
+            startPairingOver()
+        }
         // Re-render so the notification-permission checkmark reflects any change
         // made in system settings, and day/night theme stays current.
         if (homeShowing) renderHome()
     }
 
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (homeShowing) renderHome()   // system day/night switch
+        // System day/night switch.
+        if (homeShowing) renderHome()
+        else if (pairKind != PAIR_NONE) showPairingScreen(pairKind, pairEmoji, pairDetail)
+    }
+
+    // Back during Google sign-in or pairing: the sign-in page steps back, and
+    // anything else cancels the pairing and returns to the home screen. Below
+    // Android 16 back arrives here; from 16 (target SDK 36) it arrives through
+    // the callback setPairingBack registers instead.
+    @Deprecated("Back below Android 16; see setPairingBack")
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (pairingBack) onPairingBack() else super.onBackPressed()
     }
 
     /**
@@ -325,13 +365,196 @@ class MainActivity : Activity() {
 
     private var activeTab = 0   // 0=Networks, 1=Settings, 2=Status; launch default chosen in onCreate by license state
 
-    // ---- Pairing emoji confirmation screen --------------------------------
-    // Shown while startGaiaPairing() blocks. The emoji to tap is in the Google
-    // Messages app on the phone (Device pairing prompt), NOT in this WebView.
-    private fun showPairingEmoji(emoji: String) {
-        homeShowing = false
+    // ---- Google pairing: attempts, the pairing screens, expiry ------------
+    // One Gaia pairing attempt at a time, each on its own bridge. An attempt that
+    // is cancelled, started over or runs out is stopped: its bridge is
+    // disconnected (which also withdraws the prompt in Google Messages when it
+    // still can), its events are dropped and its result never changes the
+    // screen. Every pairing screen has Start over and Cancel, and back cancels,
+    // so the confirm screen can't strand anyone on an emoji Google Messages no
+    // longer shows.
+    private class PairAttempt {
+        // WAITING -> PAIRED (the pairing thread) or WAITING -> STOPPED (the UI);
+        // whichever gets there first wins.
+        val state = java.util.concurrent.atomic.AtomicInteger(WAITING)
+        @Volatile var bridge: Bridge? = null
+        var emojiAt = 0L   // elapsedRealtime when its emoji appeared; 0 = not yet
+        val stopped get() = state.get() == STOPPED
+        companion object { const val WAITING = 0; const val PAIRED = 1; const val STOPPED = 2 }
+    }
+
+    private var pairing: PairAttempt? = null          // the live attempt, main thread only
+    private var pairKind = PAIR_NONE                  // the pairing screen showing
+    private var pairEmoji = ""
+    private var pairDetail = ""
+    private var pairRestartOnResume = false
+    private var activityResumed = false
+    private var pairingBack = false                   // back cancels (sign-in or pairing up)
+    private var backCallback: Any? = null             // android.window.OnBackInvokedCallback
+    private val pairHandler = Handler(Looper.getMainLooper())
+    private val pairExpiry = Runnable { checkPairingExpiry() }
+
+    /** The bridge's events for one attempt: dropped once that attempt is stopped. */
+    private fun attemptSink(a: PairAttempt) = object : EventSink {
+        override fun onEvent(eventType: String, jsonPayload: String) {
+            if (!a.stopped) sink.onEvent(eventType, jsonPayload)
+        }
+    }
+
+    /** Stops the live attempt, if any (unless it has already paired). */
+    private fun stopPairAttempt() {
+        val a = pairing ?: return
+        pairing = null
+        pairHandler.removeCallbacks(pairExpiry)
+        if (!a.state.compareAndSet(PairAttempt.WAITING, PairAttempt.STOPPED)) return
+        val b = a.bridge ?: return   // not built yet: the pairing thread stops it itself
+        if (Mirror.bridge === b) Mirror.bridge = null
+        thread(name = "bridge-unpair") { try { b.disconnect() } catch (_: Exception) {} }
+    }
+
+    private fun onPairingEmoji(emoji: String) {
+        val a = pairing ?: return
+        if (a.stopped) return
+        a.emojiAt = SystemClock.elapsedRealtime()
+        showPairingScreen(PAIR_CONFIRM, emoji)
+        checkPairingExpiry()   // arms the expiry timer
+    }
+
+    /**
+     * Gives up the live attempt's emoji once PAIR_EXPIRE_MS have passed since it
+     * appeared with no answer from Google; otherwise (re)arms the timer for the time
+     * left. Measured on elapsedRealtime, so time asleep counts. True if it expired now.
+     */
+    private fun checkPairingExpiry(): Boolean {
+        val a = pairing ?: return false
+        if (a.emojiAt == 0L || a.stopped) return false
+        val left = PAIR_EXPIRE_MS - (SystemClock.elapsedRealtime() - a.emojiAt)
+        pairHandler.removeCallbacks(pairExpiry)
+        if (left > 0) {
+            pairHandler.postDelayed(pairExpiry, left)
+            return false
+        }
+        pairingExpired("no answer from Google ${PAIR_EXPIRE_MS / 1000} s after the emoji")
+        return true
+    }
+
+    private fun pairingExpired(why: String) {
+        LogStore.w(TAG, "Pairing expired ($why).")
+        stopPairAttempt()
+        paired = false
+        showPairingScreen(PAIR_EXPIRED)
+        // Not looking: start over when the app comes back. Looking: leave the
+        // expired screen up, so an app left open doesn't re-prompt forever.
+        if (!activityResumed) pairRestartOnResume = true
+    }
+
+    private fun pairingFailed(a: PairAttempt, msg: String) {
+        if (pairing !== a) return
+        // libgm: ErrPairingTimeout is "pairing timed out" (Google's own expiry).
+        if (msg.contains("pairing timed out")) { pairingExpired("Google: timed out"); return }
+        stopPairAttempt()
+        paired = false
+        val m = msg.lowercase()
+        val reason = when {
+            "incorrect emoji" in m -> "A different emoji was tapped in Google Messages."
+            "cancelled pairing on phone" in m -> "Pairing was cancelled in Google Messages."
+            "no devices found" in m ->
+                "Google didn't find Google Messages for this account. Check Google Messages on your phone uses this Google account."
+            "client init timed out" in m -> "Google Messages didn't answer. Check your phone is online."
+            "requires cookies" in m -> "The Google sign-in didn't finish."
+            else -> "Something went wrong while pairing."
+        }
+        showPairingScreen(PAIR_FAILED, detail = reason)
+    }
+
+    /** A new pairing: with the Google sign-in already in the cookies, else from the sign-in page. */
+    private fun startPairingOver() {
+        stopPairAttempt()
+        paired = false
+        val cookies = harvestCookies()
+        if (cookies.contains("__Secure-3PSID")) {
+            LogStore.i(TAG, "Starting pairing over with the Google sign-in already made.")
+            paired = true
+            pairWithCookies(cookies)
+        } else {
+            LogStore.i(TAG, "No Google sign-in to reuse; starting over from the sign-in page.")
+            startWebViewLogin()
+        }
+    }
+
+    private fun cancelPairing() {
+        LogStore.i(TAG, "Pairing cancelled.")
+        stopPairAttempt()
+        pairRestartOnResume = false
+        paired = false
+        val wv = webView
         webView = null
+        showHome(statusMsg)
+        reportConnectionStatus()
+        try { wv?.destroy() } catch (_: Exception) {}
+    }
+
+    private fun onPairingBack() {
+        val wv = webView
+        if (wv != null && wv.canGoBack()) wv.goBack() else cancelPairing()
+    }
+
+    /** Back cancels while the sign-in page or a pairing screen is up (see onBackPressed). */
+    private fun setPairingBack(on: Boolean) {
+        if (pairingBack == on) return
+        pairingBack = on
+        if (Build.VERSION.SDK_INT < 33) return
+        if (on) {
+            val cb = android.window.OnBackInvokedCallback { onPairingBack() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCallback = cb
+        } else {
+            (backCallback as? android.window.OnBackInvokedCallback)?.let {
+                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it)
+            }
+            backCallback = null
+        }
+    }
+
+    /** Home is back up: no pairing screen, back behaves normally again. */
+    private fun endPairingUi() {
+        pairKind = PAIR_NONE
+        setPairingBack(false)
+    }
+
+    // The emoji to tap is in the Google Messages app on the phone (Device pairing
+    // prompt), NOT in this app.
+    private fun showPairingScreen(kind: Int, emoji: String = "", detail: String = "") {
+        homeShowing = false
+        pairKind = kind; pairEmoji = emoji; pairDetail = detail
+        setPairingBack(true)
         val p = palette()
+        val title: String
+        val icon: String
+        val body: String
+        when (kind) {
+            PAIR_CONFIRM -> {
+                title = "Confirm pairing"
+                icon = if (emoji.isNotEmpty()) emoji else "\uD83D\uDD17"
+                body = "Open Google Messages on your phone, find the device-pairing prompt, and tap this emoji."
+            }
+            PAIR_EXPIRED -> {
+                title = "Pairing expired"
+                icon = "\u231B"
+                body = "This pairing ran out before it was confirmed, so its emoji is no longer in Google Messages. Start over to get a new one."
+            }
+            PAIR_FAILED -> {
+                title = "Pairing didn't finish"
+                icon = "\u26A0\uFE0F"
+                body = "$detail Start over to try again."
+            }
+            else -> {
+                title = "Starting pairing\u2026"
+                icon = "\uD83D\uDD17"
+                body = "Asking Google Messages for a pairing emoji."
+            }
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -339,20 +562,42 @@ class MainActivity : Activity() {
             setPadding(dp(32), dp(48), dp(32), dp(48))
         }
         root.addView(TextView(this).apply {
-            text = "Confirm pairing"; textSize = 22f; setTextColor(p.text)
+            text = title; textSize = 22f; setTextColor(p.text)
             gravity = Gravity.CENTER
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = if (emoji.isNotEmpty()) emoji else "\uD83D\uDD17"
+            text = icon
             textSize = 72f; gravity = Gravity.CENTER
             setPadding(0, dp(24), 0, dp(24))
         })
         root.addView(TextView(this).apply {
-            text = "Open Google Messages on your phone, find the device-pairing prompt, and tap this emoji."
+            text = body
             textSize = 16f; setTextColor(p.subtext); gravity = Gravity.CENTER
         })
-        setContentView(root)
+        root.addView(accentButton(p, "Start over") {
+            LogStore.i(TAG, "Pairing: Start over tapped.")
+            startPairingOver()
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(32) })
+        root.addView(Button(this).apply {
+            text = "Cancel"; setTextColor(p.text); textSize = 16f
+            isAllCaps = false
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = rounded(Color.TRANSPARENT, 12, 1, p.cardBorder)
+            stateListAnimator = null
+            setOnClickListener { cancelPairing() }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+        // Scrolls when the screen is too short (a folded phone in landscape), so the
+        // buttons are always reachable.
+        setContentView(ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(p.bg)
+            addView(root, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        })
     }
 
     // ---- Home screen (two-tab: Settings | Accounts) -----------------------
@@ -368,6 +613,7 @@ class MainActivity : Activity() {
 
     private fun renderHome() {
         homeShowing = true
+        endPairingUi()
         // Preserve scroll across a same-tab rebuild — toggling an account re-renders
         // the whole tab, and without this the user is yanked back to the top. A tab
         // *switch* deliberately starts fresh at the top.
@@ -2885,6 +3131,10 @@ class MainActivity : Activity() {
 
     internal fun startWebViewLogin() {
         homeShowing = false
+        stopPairAttempt()
+        paired = false          // a new sign-in always pairs once its page loads
+        pairKind = PAIR_NONE
+        setPairingBack(true)    // back steps back through the page, then cancels
         thread(name = "bridge-init") {
             try { Mirror.bridge = Mirrorbridge.newBridge("", sink) }
             catch (e: Exception) { LogStore.e(TAG, "Bridge init failed", e) }
@@ -2955,30 +3205,55 @@ class MainActivity : Activity() {
     }
 
     private fun pairWithCookies(cookiesJson: String) {
+        stopPairAttempt()
+        val a = PairAttempt()
+        pairing = a
+        showPairingScreen(PAIR_STARTING)
+        // The sign-in page is done with once its cookies are harvested. This can run
+        // inside its onPageFinished, so destroy it after that callback returns.
+        webView?.let { wv ->
+            webView = null
+            Handler(Looper.getMainLooper()).post { try { wv.destroy() } catch (_: Exception) {} }
+        }
         thread(name = "bridge-pair") {
             try {
-                val b = Mirror.bridge ?: Mirrorbridge.newBridge("", sink).also { Mirror.bridge = it }
+                // A fresh bridge per attempt: a stopped one's context is cancelled for good.
+                val b = Mirrorbridge.newBridge("", attemptSink(a))
+                a.bridge = b
+                if (a.stopped) { try { b.disconnect() } catch (_: Exception) {}; return@thread }
+                Mirror.bridge = b
                 b.setCookies(cookiesJson)
                 LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone…")
                 b.startGaiaPairing()
+                if (!a.state.compareAndSet(PairAttempt.WAITING, PairAttempt.PAIRED)) {
+                    LogStore.w(TAG, "Pairing went through after it was stopped; dropping it.")
+                    try { b.disconnect() } catch (_: Exception) {}
+                    return@thread
+                }
                 val s = b.exportSession()
                 Vault.putString(prefs, PREF_SESSION, s)   // sealed in the Keystore
                 LogStore.i(TAG, "Paired and session saved (${s.length} chars).")
                 b.connect()
                 LogStore.i(TAG, "Connected.")
                 runOnUiThread {
+                    if (pairing === a) { pairing = null; pairHandler.removeCallbacks(pairExpiry) }
                     webView = null
                     showHome("Connected. Mirroring live.")
                 }
             } catch (e: Exception) {
+                if (a.stopped) {
+                    LogStore.i(TAG, "Stopped pairing attempt ended (${e.message}).")
+                    return@thread
+                }
                 LogStore.e(TAG, "Pairing failed", e)
-                paired = false
+                runOnUiThread { pairingFailed(a, e.message ?: "") }
             }
         }
     }
 
     override fun onDestroy() {
         Mirror.onSoundChanged = null   // the Settings picker goes with this screen
+        pairHandler.removeCallbacksAndMessages(null)
         webView?.destroy()
         // Leave Mirror.bridge alive — PebbleListenerService may still need it.
         super.onDestroy()
