@@ -24,7 +24,8 @@ import java.text.BreakIterator
  * notifications Notifier posts).
  *
  * Gated by [enabled], which mirrors the user's "Emoji substitution" setting
- * (Mirror flips it when settings load). When disabled, [processText] is a no-op.
+ * (Mirror flips it when settings load), and by [watchDrawsAll] (a watch wider
+ * than the Time Steel draws every emoji). When off, [processText] is a no-op.
  *
  * Reactions reuse the SAME table via [reactionGlyph] / [substitute] so the chat
  * badge and inline text never disagree about what an emoji maps to.
@@ -35,6 +36,13 @@ object EmojiSub {
 
     /** Mirrors the user's "Emoji substitution" setting. Set from Mirror on load. */
     @Volatile var enabled: Boolean = false
+
+    /** True when the connected watch draws every emoji (wider than the Time Steel's
+     *  144: Time 2, Round 2). Set from Mirror. The filter is off there whatever the
+     *  setting says, since its switch is hidden for those watches. */
+    @Volatile var watchDrawsAll: Boolean = false
+
+    private fun active(): Boolean = enabled && !watchDrawsAll
 
     private const val VS16 = "\uFE0F"  // emoji variation selector
     // Match on a normalized key so "❤️" (with VS16) and "❤" compare equal.
@@ -82,7 +90,7 @@ object EmojiSub {
      * normally; unknown emoji tofu now and render later once Pebble adds them.
      */
     fun reactionGlyph(cluster: String): String =
-        (if (enabled) substitute(cluster) else null) ?: cluster
+        (if (active()) substitute(cluster) else null) ?: cluster
 
     /**
      * Rewrite text, swapping only the emoji we have substitutes for; supported
@@ -90,7 +98,7 @@ object EmojiSub {
      * when the setting is off or the string is plain.
      */
     fun processText(text: String): String {
-        if (!enabled || text.isEmpty()) return text
+        if (!active() || text.isEmpty()) return text
         // Fast path: if there's no high codepoint at all, there's no emoji to map.
         if (!mightContainEmoji(text)) return text
         return transform(text)
