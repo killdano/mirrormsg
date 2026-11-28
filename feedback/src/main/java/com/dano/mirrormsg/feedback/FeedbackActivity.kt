@@ -11,7 +11,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -41,7 +40,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.PlatformTextStyle
@@ -52,14 +50,14 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mirrorapps.kit.KitColors
-import com.mirrorapps.kit.LogsMode
 import com.mirrorapps.kit.feedback.FeedbackPane
 
 /**
  * The Feedback screen, the last tab of the app's home screen: MirrorMsg's
- * header and the home tabs (Feedback selected), the owner code and "Logs in
- * bug reports" settings, then the kit's Feedback chat. A tap on another tab
- * closes it, and the home screen shows that tab. Test builds only.
+ * header and the home tabs (Feedback selected), the owner code setting, then
+ * the kit's Feedback chat, which shows "Logs in bug reports" at its top (the
+ * same chat as the other apps). A tap on another tab closes it, and the home
+ * screen shows that tab. Test builds only.
  */
 class FeedbackActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -218,9 +216,7 @@ private fun RowScope.HomeTab(c: KitColors, label: String, selected: Boolean, onC
 
 @Composable
 private fun SettingsCard(c: KitColors) {
-    val context = LocalContext.current
     val code by MsgFeedback.ownerCode.collectAsState()
-    var mode by remember { mutableStateOf(MsgFeedback.logsMode(context)) }
     var editing by remember { mutableStateOf(false) }
 
     Column(
@@ -249,41 +245,6 @@ private fun SettingsCard(c: KitColors) {
             Spacer(modifier = Modifier.width(10.dp))
             Text(if (code != null) "Set" else "Not set", color = c.accent, fontSize = 14.sp)
         }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "Logs in bug reports",
-                color = c.fg,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (m in listOf(LogsMode.FULL, LogsMode.REDACTED, LogsMode.NONE)) {
-                    val selected = m == mode
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (selected) c.accent else Color.Transparent)
-                            .clickable {
-                                mode = m
-                                MsgFeedback.setLogsMode(context, m)
-                            }
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                    ) {
-                        Text(
-                            label(m),
-                            color = if (selected) c.accentFg else c.fg,
-                            fontSize = 12.sp,
-                        )
-                    }
-                }
-            }
-        }
     }
 
     if (editing) {
@@ -296,12 +257,6 @@ private fun SettingsCard(c: KitColors) {
             onDismiss = { editing = false },
         )
     }
-}
-
-private fun label(m: LogsMode) = when (m) {
-    LogsMode.FULL -> "Full"
-    LogsMode.REDACTED -> "Redacted"
-    LogsMode.NONE -> "None"
 }
 
 @Composable
