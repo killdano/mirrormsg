@@ -18,7 +18,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tidwall/gjson v1.19.0
-	go.mau.fi/mautrix-gmessages v0.2605.0
+	go.mau.fi/mautrix-gmessages v0.2609.0
 	go.mau.fi/mautrix-meta v0.2604.0
 	go.mau.fi/util v0.10.1
 	go.mau.fi/whatsmeow v0.0.0-20260416104156-3ff20cd3462a

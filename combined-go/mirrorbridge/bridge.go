@@ -9,7 +9,7 @@
 // JNI boundary cleanly. So everything that touches gmproto / libgm internals
 // stays on the Go side of this file; Kotlin only ever sees JSON strings.
 //
-// Pinned against libgm v0.2605.0 (May 2026). If Google changes the protocol and
+// Pinned against libgm v0.2609.0 (Sept 2026). If Google changes the protocol and
 // libgm bumps, re-check the spots marked "VERIFY" below against the new source.
 package mirrorbridge
 
@@ -28,6 +28,7 @@ import (
 
 	"fi.mirrormsg/watchimage"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
@@ -61,6 +62,34 @@ type Bridge struct {
 	// log lines to the sink while a pairing runs.
 	log zerolog.Logger
 	tap *pairTap
+}
+
+// httpSettings are the timeouts libgm v0.2605.0 built in for itself: 10 s to
+// dial and for the TLS handshake, 20 s for the response headers, 2 min per
+// request (libgm gives the long poll its own 30 min).
+var httpSettings = exhttp.ClientSettings{
+	GlobalTimeout:         2 * time.Minute,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ResponseHeaderTimeout: 20 * time.Second,
+}.WithDialTimeout(10 * time.Second)
+
+// rc is the context for a request to the phone. libgm (v0.2609.0) gives each
+// one its own hard timeout; this only carries the logger. It isn't b.ctx:
+// Disconnect cancels that for good, and the app turns a service off and on
+// again on the same Bridge.
+func (b *Bridge) rc() context.Context {
+	return b.log.WithContext(context.Background())
+}
+
+// readMedia downloads and decrypts a message's media in full (libgm now
+// streams it).
+func (b *Bridge) readMedia(mediaID string, key []byte) ([]byte, error) {
+	r, err := b.client.DownloadMedia(mediaID, key)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
 }
 
 func newLogger(tap *pairTap) zerolog.Logger {
@@ -122,7 +151,7 @@ func NewBridge(sessionJSON string, sink EventSink) (*Bridge, error) {
 	}
 	tap := &pairTap{sink: sink}
 	logger := newLogger(tap)
-	client := libgm.NewClient(authData, nil, logger)
+	client := libgm.NewClient(authData, nil, logger, httpSettings)
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Bridge{
 		client: client,
@@ -175,7 +204,7 @@ func emitTo(sink EventSink, eventType string, payload any) {
 // see it in Logcat and decide whether to handle it.
 //
 // The event types here are taken straight from libgm's event_handler.go
-// (v0.2605.0): incoming messages arrive as *libgm.WrappedMessage, conversation
+// (v0.2609.0): incoming messages arrive as *libgm.WrappedMessage, conversation
 // updates as *gmproto.Conversation, etc.
 func (b *Bridge) handleEvent(evt any) {
 	switch e := evt.(type) {
@@ -236,7 +265,7 @@ func (b *Bridge) StartQRPairing() (string, error) {
 		b.emit("PAIRED", data)
 	}
 	b.client.PairCallback.Store(&cb)
-	return b.client.StartLogin()
+	return b.client.StartLogin(b.log.WithContext(b.ctx))
 }
 
 // ---- Connection ------------------------------------------------------------
@@ -245,7 +274,9 @@ func (b *Bridge) StartQRPairing() (string, error) {
 // arriving as MESSAGE events on the sink. Blocking network call — keep it off
 // the main thread.
 func (b *Bridge) Connect() error {
-	return b.client.Connect()
+	// The long poll ends on Disconnect (libgm closes it itself), so it runs
+	// under rc, not under b.ctx, which a Disconnect before it has cancelled.
+	return b.client.Connect(b.rc())
 }
 
 // Disconnect stops the long-poll and cancels in-flight pairing.
@@ -278,7 +309,8 @@ func (b *Bridge) ExportSession() (string, error) {
 func (b *Bridge) ListConversations(count int) (string, error) {
 	// VERIFY: ListConversationsRequest_INBOX is the expected inbox folder enum;
 	// confirm the enum value name if this fails to compile.
-	resp, err := b.client.ListConversations(count, gmproto.ListConversationsRequest_INBOX)
+	resp, err := b.client.ListConversations(b.rc(), &gmproto.ListConversationsRequest{
+		Count: int64(count), Folder: gmproto.ListConversationsRequest_INBOX})
 	if err != nil {
 		return "", err
 	}
@@ -301,7 +333,7 @@ func (b *Bridge) FetchMessages(conversationID string, count int64, cursorJSON st
 			return "", fmt.Errorf("invalid cursor JSON: %w", err)
 		}
 	}
-	resp, err := b.client.FetchMessages(conversationID, count, cursor)
+	resp, err := b.client.FetchMessages(b.rc(), conversationID, count, cursor)
 	if err != nil {
 		return "", err
 	}
@@ -315,7 +347,7 @@ func (b *Bridge) FetchMessages(conversationID string, count int64, cursorJSON st
 // ListContacts returns the contact list as JSON (used to label conversations
 // and to power a contact picker on the watch).
 func (b *Bridge) ListContacts() (string, error) {
-	resp, err := b.client.ListContacts()
+	resp, err := b.client.ListContacts(b.rc())
 	if err != nil {
 		return "", err
 	}
@@ -365,7 +397,7 @@ func (b *Bridge) SendMessage(conversationID, text, participantID string, simTwo,
 			}},
 		},
 	}
-	resp, err := b.client.SendMessage(req)
+	resp, err := b.client.SendMessage(b.rc(), req)
 	if err != nil {
 		return "", err
 	}
@@ -401,7 +433,7 @@ func (b *Bridge) SendReply(conversationID, text, participantID, targetMsgID stri
 		},
 		Reply: &gmproto.ReplyPayload{MessageID: targetMsgID},
 	}
-	resp, err := b.client.SendMessage(req)
+	resp, err := b.client.SendMessage(b.rc(), req)
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +458,7 @@ func (b *Bridge) SendReaction(targetMsgID, emoji string, remove bool) (string, e
 	if remove {
 		action = gmproto.SendReactionRequest_REMOVE
 	}
-	resp, err := b.client.SendReaction(&gmproto.SendReactionRequest{
+	resp, err := b.client.SendReaction(b.rc(), &gmproto.SendReactionRequest{
 		MessageID:    targetMsgID,
 		ReactionData: gmproto.MakeReactionData(emoji),
 		Action:       action,
@@ -446,7 +478,7 @@ func (b *Bridge) SendReaction(targetMsgID, emoji string, remove bool) (string, e
 // (not just dismissing a local notification). Mirrors the SendReaction shape:
 // returns a small ok-JSON, or an error the caller surfaces.
 func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
-	if err := b.client.MarkRead(conversationID, messageID); err != nil {
+	if err := b.client.MarkRead(b.rc(), conversationID, messageID); err != nil {
 		return "", err
 	}
 	out, _ := json.Marshal(map[string]string{"conversationId": conversationID, "messageId": messageID})
@@ -464,7 +496,7 @@ func (b *Bridge) StartNewConversation(phoneNumber string) (string, error) {
 			Number2:       phoneNumber,
 		}},
 	}
-	resp, err := b.client.GetOrCreateConversation(req)
+	resp, err := b.client.GetOrCreateConversation(b.rc(), req)
 	if err != nil {
 		return "", err
 	}
@@ -505,10 +537,10 @@ func (b *Bridge) ListPeople() (string, error) {
 			out = append(out, p)
 		}
 	}
-	if top, err := b.client.ListTopContacts(); err == nil {
+	if top, err := b.client.ListTopContacts(b.rc()); err == nil {
 		add(top.GetContacts(), true)
 	}
-	all, err := b.client.ListContacts()
+	all, err := b.client.ListContacts(b.rc())
 	if err != nil && len(out) == 0 {
 		return "", err
 	}
@@ -526,7 +558,7 @@ func (b *Bridge) OpenPerson(number string) (string, error) {
 	req := &gmproto.GetOrCreateConversationRequest{
 		Numbers: []*gmproto.ContactNumber{{MysteriousInt: 2, Number: number, Number2: number}},
 	}
-	resp, err := b.client.GetOrCreateConversation(req)
+	resp, err := b.client.GetOrCreateConversation(b.rc(), req)
 	if err != nil {
 		return "", err
 	}
@@ -566,7 +598,7 @@ func (b *Bridge) DownloadImageForWatch(mediaID, decryptionKeyB64 string, maxW, m
 	}
 
 	// Download and decrypt.
-	rawBytes, err := b.client.DownloadMedia(mediaID, key)
+	rawBytes, err := b.readMedia(mediaID, key)
 	if err != nil {
 		return "", fmt.Errorf("DownloadMedia: %w", err)
 	}

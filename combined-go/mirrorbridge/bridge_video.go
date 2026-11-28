@@ -20,7 +20,7 @@ func (b *Bridge) DownloadMediaToFile(mediaID, decryptionKeyB64, path string) (in
 			return 0, fmt.Errorf("bad decryptionKey base64: %w", err)
 		}
 	}
-	raw, err := b.client.DownloadMedia(mediaID, key)
+	raw, err := b.readMedia(mediaID, key)
 	if err != nil {
 		return 0, fmt.Errorf("DownloadMedia: %w", err)
 	}

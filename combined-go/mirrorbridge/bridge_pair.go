@@ -16,8 +16,8 @@ import (
 )
 
 // libgm's own log message when the Google account has several phones that
-// could take the pairing (pair_google.go). VERIFY on a libgm bump: if the text
-// changes, multiDevice just stays false.
+// could take the pairing (pair_google.go, same text in v0.2609.0). VERIFY on a
+// libgm bump: if the text changes, multiDevice just stays false.
 const multiDeviceLogMsg = "Found multiple primary-looking devices for gaia pairing"
 
 // StartGaiaPairing performs Google-account pairing. It BLOCKS until pairing
@@ -87,7 +87,7 @@ func pairFailReason(err error) string {
 		return "cancelled_on_phone"
 	case errors.Is(err, libgm.ErrPairingTimeout):
 		return "expired" // Google said the request timed out
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled), errors.Is(err, libgm.ErrConnectionClosed):
 		return "stopped" // Disconnect
 	default:
 		return "other"

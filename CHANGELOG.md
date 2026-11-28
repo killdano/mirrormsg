@@ -12,3 +12,4 @@
 - Google Messages pairing asks your phone the way the Google Messages website does, and if your Google account uses Google Messages on more than one phone, Start over asks the next one.
 - Start a new chat from the watch with someone on Google Messages, WhatsApp, Telegram, Signal or Discord: New chat at the top of the watch's account switcher lists your contacts, and saying or typing part of a name finds them.
 - The Emoji substitution setting shows only for the Pebble Time and Time Steel. The Time 2 shows every emoji as sent.
+- Google Messages pairing no longer fails right after the emoji shows.

@@ -14,7 +14,7 @@ import (
 
 // ParticipantThumbnail returns a participant's photo, or nothing when there's none.
 func (b *Bridge) ParticipantThumbnail(participantID string) ([]byte, error) {
-	resp, err := b.client.GetParticipantThumbnail(participantID)
+	resp, err := b.client.GetParticipantThumbnail(b.rc(), participantID)
 	if err != nil {
 		return nil, err
 	}
