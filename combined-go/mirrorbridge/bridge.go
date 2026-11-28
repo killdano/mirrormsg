@@ -9,8 +9,10 @@
 // JNI boundary cleanly. So everything that touches gmproto / libgm internals
 // stays on the Go side of this file; Kotlin only ever sees JSON strings.
 //
-// Pinned against libgm v0.2605.0 (May 2026). If Google changes the protocol and
-// libgm bumps, re-check the spots marked "VERIFY" below against the new source.
+// Pinned against libgm v0.2605.0 (May 2026), with one Google-account pairing fix
+// backported (third_party/mautrix-gmessages/MIRRORMSG-PATCH.md). If Google
+// changes the protocol and libgm bumps, re-check the spots marked "VERIFY" below
+// against the new source.
 package mirrorbridge
 
 import (
