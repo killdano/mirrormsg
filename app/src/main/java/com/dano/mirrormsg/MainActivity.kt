@@ -265,6 +265,15 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    // A home tab tapped on the Feedback screen (test builds): that screen has
+    // closed, and onResume, which runs next, draws the tab. Back from it changes
+    // nothing.
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val pos = FeedbackFlavor.tabChosen(requestCode, resultCode, data)
+        if (pos in homeTabs.indices) activeTab = homeTabs[pos].second
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         // System day/night switch.
@@ -364,6 +373,10 @@ class MainActivity : Activity() {
         }
 
     private var activeTab = 0   // 0=Networks, 1=Settings, 2=Status; launch default chosen in onCreate by license state
+
+    // The home tabs in the order they're drawn: label and activeTab value. The
+    // Feedback screen (test builds) draws the same row from these labels.
+    private val homeTabs = listOf("Networks" to 0, "Status" to 2, "Settings" to 1)
 
     // ---- Google pairing: attempts, the pairing screens, expiry ------------
     // One Gaia pairing attempt at a time, each on its own bridge. An attempt that
@@ -701,21 +714,18 @@ class MainActivity : Activity() {
                 if (selected) 0 else 1, p.cardBorder)
             setOnClickListener { activeTab = index; renderHome() }
         }
-        val settingsTab = tab("Settings", 1)
-        val accountsTab = tab("Networks", 0)
-        val statusTab = tab("Status", 2)
         val gap = if (withFeedback) 6 else 10
-        tabRow.addView(accountsTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
-        tabRow.addView(statusTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
-        tabRow.addView(settingsTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        homeTabs.forEachIndexed { i, (label, index) ->
+            if (i > 0) tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
+            tabRow.addView(tab(label, index), LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
         if (withFeedback) {
+            // The Feedback screen draws this header and these tabs too, with
+            // Feedback selected; a tab tapped there comes back through
+            // onActivityResult.
             val feedbackTab = tab("Feedback", -1).apply {
-                setOnClickListener { FeedbackFlavor.open(this@MainActivity) }
+                setOnClickListener { FeedbackFlavor.open(this@MainActivity, homeTabs.map { it.first }) }
             }
             tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
             tabRow.addView(feedbackTab, LinearLayout.LayoutParams(0,
