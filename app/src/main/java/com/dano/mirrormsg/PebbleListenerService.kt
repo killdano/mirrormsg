@@ -966,7 +966,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         // misfire for a chat the user already backed out of. Fire-and-forget and
         // idempotent; a dropped signal self-heals on the next open or app close.
         if (data[Schema.KEY_THREAD_CLOSED] != null) {
-            LogStore.i(TAG, "Watch left thread view — clearing open convo (was ${Mirror.currentOpenConvoId})")
+            val closedConvoId = Mirror.currentOpenConvoId
+            LogStore.i(TAG, "Watch left thread view — clearing open convo (was $closedConvoId)")
             // Forget where the ladder ended up for this thread's animations. A rung
             // is bumped because the watch could not hold something AT THAT MOMENT —
             // often fragmentation rather than size — so carrying it forever would
@@ -974,6 +975,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             // position lasts as long as the viewing session and no longer.
             Mirror.clearGifRungs()
             Mirror.currentOpenConvoId = null
+            // A chat opened from a message card on a map app: Back brings that app back.
+            MapCard.onThreadClosed(applicationContext, closedConvoId)
             return ReceiveResult.Ack
         }
 
@@ -5326,6 +5329,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             // (the flag was previously never cleared, so the last-open convo
             // kept getting pushed forever).
             Mirror.currentOpenConvoId = null
+            // A chat opened from a map app's message card no longer brings it back.
+            MapCard.onWatchAppClosed()
             LogStore.i(TAG, "Watchapp closed")
         }
     }
