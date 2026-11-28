@@ -3239,10 +3239,17 @@ class MainActivity : Activity() {
         wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (url == null || webView !== wv) return
+                val uri = try { android.net.Uri.parse(url) } catch (_: Exception) { null }
                 // Host and path only: the query can name the account.
-                val page = try { android.net.Uri.parse(url).let { "${it.host}${it.path}" } } catch (_: Exception) { "?" }
+                val page = uri?.let { "${it.host}${it.path}" } ?: "?"
                 LogStore.i(TAG, "Pairing: sign-in page loaded: $page")
-                if (url.contains("messages.google.com/web") && !paired && harvesting !== wv) {
+                // The Messages site itself, by host and path. Google's own sign-in
+                // pages carry its address in their query (continue=...), and matching
+                // the whole URL started the cookie check while the user was still
+                // signing in.
+                val messagesPage = uri != null && uri.host == "messages.google.com" &&
+                    (uri.path ?: "").startsWith("/web")
+                if (messagesPage && !paired && harvesting !== wv) {
                     harvesting = wv
                     tryHarvest(wv, 0)
                 }
@@ -3255,28 +3262,31 @@ class MainActivity : Activity() {
 
     /**
      * Pairs with the sign-in cookies once __Secure-3PSID is there. Google can set
-     * it a moment after the page has loaded, with no further page load to wait
-     * for, so look again every second for 15 s rather than leave the sign-in page
-     * up with nothing happening.
+     * it a moment after the Messages page has loaded, with no further page load
+     * to wait for, so look again every second for as long as the sign-in page is
+     * up. It never gives up by itself: the user may still be signing in, and back
+     * (or Cancel) leaves the page.
      */
     private fun tryHarvest(wv: WebView, tries: Int) {
         if (paired || webView !== wv) return
-        val cookies = harvestCookies()
-        if (!cookies.contains("__Secure-3PSID")) {
+        if (!hasSignInCookie()) {
             if (tries == 0) LogStore.w(TAG, "At messages page but __Secure-3PSID not set yet; waiting.")
-            if (tries < 15) {
-                pairHandler.postDelayed({ tryHarvest(wv, tries + 1) }, 1000L)
-            } else {
-                LogStore.w(TAG, "Pairing: the sign-in cookie never arrived; pairing not started.")
-                webView = null
-                showPairingScreen(PAIR_FAILED, detail = "The Google sign-in didn't finish.")
-                try { wv.destroy() } catch (_: Exception) {}   // off screen now
-            }
+            else if (tries % 30 == 0) LogStore.w(TAG, "Pairing: still no sign-in cookie after ${tries}s; the sign-in page stays up.")
+            pairHandler.postDelayed({ tryHarvest(wv, tries + 1) }, 1000L)
             return
         }
+        val cookies = harvestCookies()
         paired = true
         LogStore.i(TAG, "Login complete; harvested cookies. Pairing…")
         pairWithCookies(cookies)
+    }
+
+    /** Whether the Google sign-in cookie is set yet. Quiet: tryHarvest asks every second. */
+    private fun hasSignInCookie(): Boolean {
+        val cm = CookieManager.getInstance()
+        return COOKIE_URLS.any { u ->
+            cm.getCookie(u)?.split("; ")?.any { it.startsWith("__Secure-3PSID=") } == true
+        }
     }
 
     private fun harvestCookies(): String {
