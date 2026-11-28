@@ -1,6 +1,7 @@
 package com.dano.mirrormsg.feedback
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 
 /**
@@ -14,4 +15,8 @@ internal object FeedbackFlavor {
     fun open(activity: Activity, tabs: List<String>) {}
 
     fun tabChosen(requestCode: Int, resultCode: Int, data: Intent?): Int = -1
+
+    fun hasOwnerCode(context: Context): Boolean = false
+
+    fun editOwnerCode(activity: Activity, onChanged: () -> Unit) {}
 }

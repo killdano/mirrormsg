@@ -188,7 +188,7 @@ internal object TestBuilds {
             Phase.WAITING_FOR_TAP -> "tap the notification to install"
             Phase.HELD -> "waiting: ${s.note}"
             Phase.FAILED -> s.note
-            Phase.IDLE -> s.note?.let { if (it == "no access code yet") "set the owner code on the Feedback screen" else it }
+            Phase.IDLE -> s.note?.let { if (it == "no access code yet") "set the owner code below" else it }
             Phase.UP_TO_DATE, Phase.NEWER_BUT_OFF -> null
         }
         return "Installed $installed · newest $newest" + (doing?.let { " · $it" } ?: "")
