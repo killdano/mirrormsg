@@ -928,8 +928,43 @@ class MainActivity : Activity() {
                 TestBuilds.setAutoInstall(this, on)
             }
             TestBuilds.bindDetail(detail)
+            // The owner code (FeedbackFlavor): the Feedback screen asks for it only
+            // while none is set, so changing or clearing a saved one is here.
+            if (FeedbackFlavor.available) {
+                addDivider(tbCard, p)
+                addOwnerCodeRow(tbCard, p)
+            }
             c.addView(tbCard)
         }
+    }
+
+    // Settings > Test builds: the owner code, set or not; a tap pastes a new one
+    // or clears it (FeedbackFlavor.editOwnerCode). Debug builds only.
+    private fun addOwnerCodeRow(parent: LinearLayout, p: Palette) {
+        fun state() = if (FeedbackFlavor.hasOwnerCode(this)) "Set. Tap to change or clear it"
+            else "Not set. Tap to paste your access code"
+        val sub = TextView(this).apply {
+            text = state(); textSize = 13f; setTextColor(p.subtext)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener {
+                FeedbackFlavor.editOwnerCode(this@MainActivity) { sub.text = state() }
+            }
+        }
+        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        txt.addView(TextView(this).apply {
+            text = "Owner code"; textSize = 16f; setTextColor(p.text)
+        })
+        txt.addView(sub)
+        row.addView(txt, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(TextView(this).apply {
+            text = "\u203A"; textSize = 22f; setTextColor(p.subtext)
+        })
+        parent.addView(row)
     }
 
     // Dithering: a switch that reveals three sliders (edge protection, strength,

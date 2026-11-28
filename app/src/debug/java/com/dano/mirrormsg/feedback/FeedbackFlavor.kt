@@ -1,9 +1,13 @@
 package com.dano.mirrormsg.feedback
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.text.InputType
+import android.widget.EditText
+import android.widget.FrameLayout
 import com.dano.mirrormsg.LogStore
 import com.dano.mirrormsg.Vault
 import com.dano.mirrormsg.testbuild.TestBuilds
@@ -15,7 +19,9 @@ import com.mirrorapps.kit.KitLog
  * with MirrorMsg's log, its bug-report sections ([MsgBundle]) and the owner
  * code, which is sealed in the app's [Vault]. The owner code is also the
  * test-build updater's credential ([ownerCode], testbuild/TestBuilds.kt). The
- * release source set has a no-op copy of this object.
+ * Feedback screen asks for it only while none is set; Settings > Test builds
+ * changes or clears it ([editOwnerCode]). The release source set has a no-op
+ * copy of this object.
  */
 internal object FeedbackFlavor {
     val available: Boolean = true
@@ -53,6 +59,56 @@ internal object FeedbackFlavor {
     fun ownerCode(context: Context): String? {
         val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return Vault.getString(prefs, KEY_CODE).trim().ifEmpty { null }
+    }
+
+    /** Whether an owner code is saved (Settings > Test builds shows it). */
+    fun hasOwnerCode(context: Context): Boolean = ownerCode(context) != null
+
+    /**
+     * Settings > Test builds: paste a new owner code, or clear the saved one.
+     * [onChanged] runs after either, on the main thread.
+     */
+    fun editOwnerCode(activity: Activity, onChanged: () -> Unit) {
+        try {
+            val hasCode = hasOwnerCode(activity)
+            val pad = (20 * activity.resources.displayMetrics.density).toInt()
+            val field = EditText(activity).apply {
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                hint = if (hasCode) "Saved (paste to replace)" else "Access code"
+            }
+            val box = FrameLayout(activity).apply {
+                setPadding(pad, pad / 2, pad, 0)
+                addView(field)
+            }
+            val builder = AlertDialog.Builder(activity)
+                .setTitle("Owner code")
+                .setMessage(
+                    "Paste your access code. It's stored encrypted on this phone and only " +
+                        "sent with your Feedback messages."
+                )
+                .setView(box)
+                .setPositiveButton("Save") { _, _ ->
+                    val v = field.text.toString().trim()
+                    if (v.isNotEmpty()) setOwnerCode(activity, v, onChanged)
+                }
+                .setNegativeButton("Cancel", null)
+            if (hasCode) builder.setNeutralButton("Clear") { _, _ -> setOwnerCode(activity, null, onChanged) }
+            builder.show()
+        } catch (t: Throwable) {
+            LogStore.e(TAG, "Feedback: couldn't open the owner code dialog", t)
+        }
+    }
+
+    /** Saves (or with null, clears) the owner code where the Feedback screen keeps it. */
+    private fun setOwnerCode(context: Context, value: String?, onChanged: () -> Unit) {
+        try {
+            init(context)
+            MsgFeedback.setOwnerCode(value)
+            LogStore.i(TAG, if (value == null) "Feedback: owner code cleared" else "Feedback: owner code saved")
+        } catch (t: Throwable) {
+            LogStore.e(TAG, "Feedback: couldn't save the owner code", t)
+        }
+        onChanged()
     }
 
     private fun init(context: Context) {

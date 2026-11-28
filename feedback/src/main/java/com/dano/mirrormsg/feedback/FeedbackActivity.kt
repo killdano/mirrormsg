@@ -54,7 +54,8 @@ import com.mirrorapps.kit.feedback.FeedbackPane
 
 /**
  * The Feedback screen, the last tab of the app's home screen: MirrorMsg's
- * header and the home tabs (Feedback selected), the owner code setting, then
+ * header and the home tabs (Feedback selected), the owner code card while no
+ * code is set (Settings > Test builds changes or clears a saved one), then
  * the kit's Feedback chat, which shows "Logs in bug reports" at its top (the
  * same chat as the other apps). A tap on another tab closes it, and the home
  * screen shows that tab. Test builds only.
@@ -104,6 +105,7 @@ class FeedbackActivity : ComponentActivity() {
 @Composable
 private fun FeedbackScreen(tabs: List<String>, onTab: (Int) -> Unit) {
     val c = MsgTheme.colors()
+    val code by MsgFeedback.ownerCode.collectAsState()
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -113,8 +115,10 @@ private fun FeedbackScreen(tabs: List<String>, onTab: (Int) -> Unit) {
     ) {
         HomeHeader(c)
         HomeTabs(c, tabs, onTab)
-        SettingsCard(c)
-        Spacer(modifier = Modifier.height(8.dp))
+        if (code == null) {
+            OwnerCodeCard(c)
+            Spacer(modifier = Modifier.height(8.dp))
+        }
         FeedbackPane(modifier = Modifier.weight(1f))
     }
 }
@@ -214,9 +218,9 @@ private fun RowScope.HomeTab(c: KitColors, label: String, selected: Boolean, onC
     }
 }
 
+/** Shown only while no owner code is set: saving one hides it. */
 @Composable
-private fun SettingsCard(c: KitColors) {
-    val code by MsgFeedback.ownerCode.collectAsState()
+private fun OwnerCodeCard(c: KitColors) {
     var editing by remember { mutableStateOf(false) }
 
     Column(
@@ -243,13 +247,12 @@ private fun SettingsCard(c: KitColors) {
                 )
             }
             Spacer(modifier = Modifier.width(10.dp))
-            Text(if (code != null) "Set" else "Not set", color = c.accent, fontSize = 14.sp)
+            Text("Not set", color = c.accent, fontSize = 14.sp)
         }
     }
 
     if (editing) {
         OwnerCodeDialog(
-            hasCode = code != null,
             onSave = {
                 MsgFeedback.setOwnerCode(it)
                 editing = false
@@ -260,7 +263,7 @@ private fun SettingsCard(c: KitColors) {
 }
 
 @Composable
-private fun OwnerCodeDialog(hasCode: Boolean, onSave: (String?) -> Unit, onDismiss: () -> Unit) {
+private fun OwnerCodeDialog(onSave: (String) -> Unit, onDismiss: () -> Unit) {
     var text by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -278,7 +281,7 @@ private fun OwnerCodeDialog(hasCode: Boolean, onSave: (String?) -> Unit, onDismi
                     onValueChange = { text = it },
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
-                    placeholder = { Text(if (hasCode) "Saved (paste to replace)" else "Access code") },
+                    placeholder = { Text("Access code") },
                 )
             }
         },
@@ -286,12 +289,7 @@ private fun OwnerCodeDialog(hasCode: Boolean, onSave: (String?) -> Unit, onDismi
             TextButton(onClick = { onSave(text) }, enabled = text.isNotBlank()) { Text("Save") }
         },
         dismissButton = {
-            Row {
-                if (hasCode) {
-                    TextButton(onClick = { onSave(null) }) { Text("Clear") }
-                }
-                TextButton(onClick = onDismiss) { Text("Cancel") }
-            }
+            TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
 }
