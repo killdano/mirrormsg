@@ -31,3 +31,6 @@ Here, always:
 - A change users would notice adds one plain-language line under
   `## Unreleased` in `CHANGELOG.md` (no internal names, no message text,
   names or numbers). Those lines become the store release notes.
+  `.github/workflows/changelog.yml` fails a PR into main that changes
+  the app without a new line there, unless its description says
+  `Changelog: none` on a line of its own (users won't notice it).
