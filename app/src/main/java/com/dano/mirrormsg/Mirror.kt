@@ -52,6 +52,28 @@ object Mirror {
     // watch-swap self-corrects; both platforms have only two values, so brief
     // staleness is harmless (one list render at the old pad).
     @Volatile var watchDisplayW: Int = 0
+    // The same width, kept across restarts (0 = never reported). Only the Emoji
+    // substitution setting reads it: the Time / Time Steel's font (144 wide) lacks
+    // many emoji, while the Time 2 and Round 2 draw them all. Kept so that switch is
+    // right as soon as the app starts, not only after this run's first image request.
+    @Volatile var lastWatchW: Int = 0
+    /** Told when the watch's reported width changes (first report, or a watch swap): the Settings screen. */
+    @Volatile var onWatchWidthChanged: (() -> Unit)? = null
+
+    /** Whether Emoji substitution applies to this watch: the Time / Time Steel, or a
+     *  width not reported yet. Hidden and off on anything wider. */
+    fun emojiSubForWatch(): Boolean = lastWatchW <= 144
+
+    /** A request reported the watch's display width. */
+    fun noteWatchWidth(ctx: Context, w: Int) {
+        watchDisplayW = w
+        if (w == lastWatchW) return
+        lastWatchW = w
+        EmojiSub.watchDrawsAll = !emojiSubForWatch()
+        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
+            .edit().putInt("lastWatchW", w).apply()
+        onWatchWidthChanged?.invoke()
+    }
 
     // The watch's MESSAGE window size (20 Basalt / 40 Emery), cached from the count it
     // sends on thread-open and message-span requests. Newest-span pushes (thread open,
@@ -469,6 +491,8 @@ object Mirror {
         watchCalls = prefs.getBoolean("watchCalls", false)
         emojiSubstitution = prefs.getBoolean("emojiSubstitution", false)
         EmojiSub.enabled = emojiSubstitution
+        lastWatchW = prefs.getInt("lastWatchW", 0)
+        EmojiSub.watchDrawsAll = !emojiSubForWatch()
         videoSoundLow = prefs.getBoolean("videoSoundLow", false)
         pushTone = prefs.getInt("pushTone", 1).coerceIn(0, TONE_NAMES.size - 1)
         lastTone = prefs.getInt("lastTone", if (pushTone > 0) pushTone else 1)

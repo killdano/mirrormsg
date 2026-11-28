@@ -802,12 +802,20 @@ class MainActivity : Activity() {
             pushConversationsToWatch()
         }
         addDivider(setCard, p)
-        addToggleRow(setCard, p, "Emoji substitution",
-            "Show unsupported emoji as a close supported one", Mirror.emojiSubstitution) { on ->
-            Mirror.setEmojiSubstitution(this, on)
-            pushConversationsToWatch()
+        // Only for the Time / Time Steel (or before the watch has said which it is):
+        // the Time 2 and Round 2 draw every emoji. Redrawn when the watch's width
+        // first arrives or changes.
+        if (Mirror.emojiSubForWatch()) {
+            addToggleRow(setCard, p, "Emoji substitution",
+                "Show unsupported emoji as a close supported one", Mirror.emojiSubstitution) { on ->
+                Mirror.setEmojiSubstitution(this, on)
+                pushConversationsToWatch()
+            }
+            addDivider(setCard, p)
         }
-        addDivider(setCard, p)
+        Mirror.onWatchWidthChanged = {
+            runOnUiThread { if (homeShowing && activeTab == 1 && activityResumed) renderHome() }
+        }
         // Calls from the watch (Calls.kt): a Call row in the watch's reply menu. Turning
         // it on asks for the phone-call and contacts permissions.
         addToggleRow(setCard, p, "Calls from the watch",
@@ -3335,6 +3343,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         Mirror.onSoundChanged = null   // the Settings picker goes with this screen
+        Mirror.onWatchWidthChanged = null
         pairHandler.removeCallbacksAndMessages(null)
         webView?.destroy()
         // Leave Mirror.bridge alive — PebbleListenerService may still need it.

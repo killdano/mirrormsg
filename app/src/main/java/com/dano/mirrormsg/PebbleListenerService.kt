@@ -577,7 +577,10 @@ class PebbleListenerService : BasePebbleListenerService() {
         // both use the real screen width. Absent => cache unchanged (defaults to 0 →
         // 144-equivalent behavior everywhere it's consumed).
         (data[Schema.KEY_REQ_DISPLAY_W] as? PebbleDictionaryItem.Int32)?.value?.let {
-            if (it > 0) Mirror.watchDisplayW = it
+            if (it > 0 && it != Mirror.lastWatchW) LogStore.i(TAG,
+                "Watch display width $it (was ${Mirror.lastWatchW}); emoji substitution " +
+                (if (it > 144) "off for this watch" else "available"))
+            if (it > 0) Mirror.noteWatchWidth(applicationContext, it)
         }
         (data[Schema.KEY_REQ_ANIM_THUMB] as? PebbleDictionaryItem.Int32)?.value?.let {
             Mirror.watchAnimThumbs = it == 1
