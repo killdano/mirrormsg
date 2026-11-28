@@ -23,9 +23,9 @@ func (b *Bridge) DownloadMediaForWatch(mediaID, decryptionKeyB64 string,
 			return "", fmt.Errorf("bad decryptionKey base64: %w", err)
 		}
 	}
-	raw, err := b.client.DownloadMedia(mediaID, key)
+	raw, err := b.downloadMedia(mediaID, key)
 	if err != nil {
-		return "", fmt.Errorf("DownloadMedia: %w", err)
+		return "", err
 	}
 	return mediaroute.Encode(raw, maxW, maxH, maxBytes, quality, fpsFloor, maxFrames, gifBytes, startRung)
 }

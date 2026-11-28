@@ -14,7 +14,7 @@ import (
 
 // ParticipantThumbnail returns a participant's photo, or nothing when there's none.
 func (b *Bridge) ParticipantThumbnail(participantID string) ([]byte, error) {
-	resp, err := b.client.GetParticipantThumbnail(participantID)
+	resp, err := b.client.GetParticipantThumbnail(b.bg(), participantID)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +28,7 @@ func (b *Bridge) ParticipantThumbnail(participantID string) ([]byte, error) {
 
 // GroupAvatar fetches a group chat's icon from its address (groupAvatarURL).
 func (b *Bridge) GroupAvatar(url string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(b.ctx, 20*time.Second)
+	ctx, cancel := context.WithTimeout(b.bg(), 20*time.Second)
 	defer cancel()
 	return b.client.DownloadAvatar(ctx, url)
 }
