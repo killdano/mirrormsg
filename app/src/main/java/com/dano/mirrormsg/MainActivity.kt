@@ -379,6 +379,7 @@ class MainActivity : Activity() {
         val state = java.util.concurrent.atomic.AtomicInteger(WAITING)
         @Volatile var bridge: Bridge? = null
         var emojiAt = 0L   // elapsedRealtime when its emoji appeared; 0 = not yet
+        @Volatile var multiDevice = false   // the account has several phones that could take it
         val stopped get() = state.get() == STOPPED
         companion object { const val WAITING = 0; const val PAIRED = 1; const val STOPPED = 2 }
     }
@@ -393,11 +394,39 @@ class MainActivity : Activity() {
     private var backCallback: Any? = null             // android.window.OnBackInvokedCallback
     private val pairHandler = Handler(Looper.getMainLooper())
     private val pairExpiry = Runnable { checkPairingExpiry() }
+    // When the Google account has Google Messages on several phones, libgm asks
+    // the one seen most recently, which may not be the one in hand. Then the
+    // next attempt asks the next phone (the bridge's SetPairingTarget).
+    @Volatile private var pairMultiDevice = false     // set by the last attempt
+    private var pairTarget = 0
 
     /** The bridge's events for one attempt: dropped once that attempt is stopped. */
     private fun attemptSink(a: PairAttempt) = object : EventSink {
         override fun onEvent(eventType: String, jsonPayload: String) {
-            if (!a.stopped) sink.onEvent(eventType, jsonPayload)
+            if (a.stopped) return
+            when (eventType) {
+                "PAIR_STEP", "PAIR_LOG", "PAIR_FAILED" -> onPairingDiag(a, eventType, jsonPayload)
+                else -> sink.onEvent(eventType, jsonPayload)
+            }
+        }
+    }
+
+    /**
+     * The bridge's account of a pairing (bridge_pair.go): the config fetch,
+     * libgm's own steps (counts, timings and errors only) and why it stopped.
+     * Logged, so View logs shows where a pairing got to.
+     */
+    private fun onPairingDiag(a: PairAttempt, type: String, payload: String) {
+        if (type == "PAIR_FAILED") LogStore.w(TAG, "Pairing stopped: $payload")
+        else LogStore.i(TAG, "Pairing: $type $payload")
+        val several = try {
+            val j = JSONObject(payload)
+            j.optInt("devices", 0) > 1 || j.optBoolean("multiDevice", false)
+        } catch (_: Exception) { false }
+        if (several && !a.multiDevice) {
+            a.multiDevice = true
+            pairMultiDevice = true
+            LogStore.i(TAG, "Pairing: this Google account has more than one phone with Google Messages (asked phone $pairTarget).")
         }
     }
 
@@ -455,6 +484,9 @@ class MainActivity : Activity() {
         stopPairAttempt()
         paired = false
         val m = msg.lowercase()
+        // Tapped or turned down in Google Messages: the prompt reached the phone
+        // in hand, so the next attempt asks that same one.
+        if ("incorrect emoji" in m || "cancelled pairing on phone" in m) pairMultiDevice = false
         val reason = when {
             "incorrect emoji" in m -> "A different emoji was tapped in Google Messages."
             "cancelled pairing on phone" in m -> "Pairing was cancelled in Google Messages."
@@ -574,6 +606,12 @@ class MainActivity : Activity() {
         root.addView(TextView(this).apply {
             text = body
             textSize = 16f; setTextColor(p.subtext); gravity = Gravity.CENTER
+        })
+        if (pairMultiDevice && kind != PAIR_STARTING) root.addView(TextView(this).apply {
+            text = "This Google account has Google Messages on more than one phone, so the " +
+                "prompt may be on another one. Start over asks the next phone."
+            textSize = 14f; setTextColor(p.subtext); gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, 0)
         })
         root.addView(accentButton(p, "Start over") {
             LogStore.i(TAG, "Pairing: Start over tapped.")
@@ -3174,19 +3212,45 @@ class MainActivity : Activity() {
 
         wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                if (url != null && url.contains("messages.google.com/web") && !paired) {
-                    val cookies = harvestCookies()
-                    if (!cookies.contains("__Secure-3PSID")) {
-                        LogStore.w(TAG, "At messages page but __Secure-3PSID not set yet; waiting.")
-                        return
-                    }
-                    paired = true
-                    LogStore.i(TAG, "Login complete; harvested cookies. Pairing…")
-                    pairWithCookies(cookies)
+                if (url == null || webView !== wv) return
+                // Host and path only: the query can name the account.
+                val page = try { android.net.Uri.parse(url).let { "${it.host}${it.path}" } } catch (_: Exception) { "?" }
+                LogStore.i(TAG, "Pairing: sign-in page loaded: $page")
+                if (url.contains("messages.google.com/web") && !paired && harvesting !== wv) {
+                    harvesting = wv
+                    tryHarvest(wv, 0)
                 }
             }
         }
         wv.loadUrl(LOGIN_URL)
+    }
+
+    private var harvesting: WebView? = null   // the sign-in page being checked for its cookie
+
+    /**
+     * Pairs with the sign-in cookies once __Secure-3PSID is there. Google can set
+     * it a moment after the page has loaded, with no further page load to wait
+     * for, so look again every second for 15 s rather than leave the sign-in page
+     * up with nothing happening.
+     */
+    private fun tryHarvest(wv: WebView, tries: Int) {
+        if (paired || webView !== wv) return
+        val cookies = harvestCookies()
+        if (!cookies.contains("__Secure-3PSID")) {
+            if (tries == 0) LogStore.w(TAG, "At messages page but __Secure-3PSID not set yet; waiting.")
+            if (tries < 15) {
+                pairHandler.postDelayed({ tryHarvest(wv, tries + 1) }, 1000L)
+            } else {
+                LogStore.w(TAG, "Pairing: the sign-in cookie never arrived; pairing not started.")
+                webView = null
+                showPairingScreen(PAIR_FAILED, detail = "The Google sign-in didn't finish.")
+                try { wv.destroy() } catch (_: Exception) {}   // off screen now
+            }
+            return
+        }
+        paired = true
+        LogStore.i(TAG, "Login complete; harvested cookies. Pairing…")
+        pairWithCookies(cookies)
     }
 
     private fun harvestCookies(): String {
@@ -3206,6 +3270,14 @@ class MainActivity : Activity() {
 
     private fun pairWithCookies(cookiesJson: String) {
         stopPairAttempt()
+        // The last attempt went to one of several phones and was never answered
+        // there: ask the next one this time.
+        if (pairMultiDevice) {
+            pairTarget++
+            LogStore.i(TAG, "Pairing: asking the next phone on this Google account (phone $pairTarget).")
+        }
+        pairMultiDevice = false
+        val target = pairTarget
         val a = PairAttempt()
         pairing = a
         showPairingScreen(PAIR_STARTING)
@@ -3223,13 +3295,15 @@ class MainActivity : Activity() {
                 if (a.stopped) { try { b.disconnect() } catch (_: Exception) {}; return@thread }
                 Mirror.bridge = b
                 b.setCookies(cookiesJson)
-                LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone…")
+                b.setPairingTarget(target.toLong())
+                LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone… (phone $target)")
                 b.startGaiaPairing()
                 if (!a.state.compareAndSet(PairAttempt.WAITING, PairAttempt.PAIRED)) {
                     LogStore.w(TAG, "Pairing went through after it was stopped; dropping it.")
                     try { b.disconnect() } catch (_: Exception) {}
                     return@thread
                 }
+                pairMultiDevice = false   // this phone answered: keep asking it
                 val s = b.exportSession()
                 Vault.putString(prefs, PREF_SESSION, s)   // sealed in the Keystore
                 LogStore.i(TAG, "Paired and session saved (${s.length} chars).")

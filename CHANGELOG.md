@@ -8,3 +8,4 @@
 - Reactions picked on the watch always go as reactions, and emoji picked to write always go as text.
 - When a message or reaction sent from the watch doesn't go, the watch shows a notification saying so.
 - Pairing Google Messages can always be cancelled or started over, and a pairing that runs out no longer leaves the app stuck on the confirm screen.
+- Google Messages pairing asks your phone the way the Google Messages website does, and if your Google account uses Google Messages on more than one phone, Start over asks the next one.
