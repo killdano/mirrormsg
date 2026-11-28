@@ -2510,6 +2510,11 @@ class MainActivity : Activity() {
         // 1. Let the service clear its own session/state (Google clears its
         //    session + cached number; Facebook clears its fb_session, etc.).
         service.logout(this)
+        // Its cached conversation lists go too, and an open watchapp is told now:
+        // it gets the next logged-in account's list, or the empty roster (the
+        // watch then drops its saved list and asks to log in on the phone).
+        Mirror.dropCachedConvoLists(this, service.id)
+        PebbleListenerService.instance?.resyncAfterLogout()
         // 2. Wipe WebView cookies so the next login starts fresh. (Both Google
         //    and Facebook log in via harvested WebView cookies, so this is
         //    shared cleanup — harmless for services that don't use it.)

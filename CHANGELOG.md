@@ -7,3 +7,4 @@
 - Calls from the watch: call a text, WhatsApp, Signal or Telegram chat from the watch's reply menu. The call starts on your phone. Turn it on in Settings.
 - Reactions picked on the watch always go as reactions, and emoji picked to write always go as text.
 - When a message or reaction sent from the watch doesn't go, the watch shows a notification saying so.
+- After you log out of every network, the watch no longer shows the old chats, and logging out reaches an open watch app right away.

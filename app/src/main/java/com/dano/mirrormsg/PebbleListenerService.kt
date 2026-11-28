@@ -4618,12 +4618,14 @@ class PebbleListenerService : BasePebbleListenerService() {
             // the active account a REAL logged-in one (the persisted id — or the
             // "google" default — may name a wiped account), so we never boot the
             // watch into a dead account with an empty list and broken nav.
-            Mirror.ensureActiveLoggedIn(this)
-            val svc = Mirror.activeService() ?: run {
-                // Nothing logged in (e.g. right after a full wipe). Still send the
-                // authoritative (empty) roster so the watch discards its stale
-                // account list instead of showing accounts that no longer exist.
-                LogStore.w(TAG, "No service for auto-push — reporting empty roster")
+            // Use what ensureActiveLoggedIn resolved, not Mirror.activeService():
+            // with nothing logged in, activeService() still names the logged-out
+            // account, and its cached list used to stream to the watch.
+            val svc = Mirror.ensureActiveLoggedIn(this) ?: run {
+                // Nothing logged in (a logout, or right after a full wipe). Send
+                // only the authoritative (empty) roster: the watch drops its saved
+                // list and asks the user to log in on the phone. No list follows.
+                LogStore.w(TAG, "Nothing logged in — reporting empty roster, no list")
                 reportServiceList()
                 return
             }
@@ -4682,6 +4684,17 @@ class PebbleListenerService : BasePebbleListenerService() {
         } catch (e: Exception) {
             LogStore.e(TAG, "pushConversations failed", e)
         }
+    }
+
+    /**
+     * Re-syncs the open watchapp after a logout on the phone: the new roster, and
+     * the list of whichever account is active now, or only the empty roster when
+     * nothing is logged in. Nothing is sent while the watchapp is closed (the next
+     * open does the same resync).
+     */
+    fun resyncAfterLogout() {
+        if (!Mirror.watchAppOpen) return
+        scope.launch { pushConversations() }
     }
 
     /**
