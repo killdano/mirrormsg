@@ -453,24 +453,87 @@ func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
 	return string(out), nil
 }
 
-// VERIFY: ContactNumber field population. The bridge derives Number /
-// FormattedNumber / MysteriousInt via libphonenumber; here we set the obvious
-// ones. Confirm against msgconv if creation fails.
+// StartNewConversation returns the conversation with phoneNumber, creating it when
+// there is none (GetOrCreateConversation), as protojson of the response. The number
+// is given the way mautrix-gmessages' ResolveIdentifier gives it (startchat.go).
 func (b *Bridge) StartNewConversation(phoneNumber string) (string, error) {
 	req := &gmproto.GetOrCreateConversationRequest{
-		Numbers: []*gmproto.ContactNumber{
-			{
-				// Number is a plain string; FormattedNumber is *string.
-				Number:          phoneNumber,
-				FormattedNumber: &phoneNumber,
-			},
-		},
+		Numbers: []*gmproto.ContactNumber{{
+			MysteriousInt: 2,
+			Number:        phoneNumber,
+			Number2:       phoneNumber,
+		}},
 	}
 	resp, err := b.client.GetOrCreateConversation(req)
 	if err != nil {
 		return "", err
 	}
 	bytes, err := protojson.Marshal(resp)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+// ListPeople returns the contacts a new chat can start with (the watch's New chat):
+// the ones written to most first (ListTopContacts), then the rest of the list, as
+// {"people":[{"id","name","detail","rank","color"}]}. id is the number
+// OpenPerson takes; rank 1.. for the top ones.
+func (b *Bridge) ListPeople() (string, error) {
+	type person struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail,omitempty"`
+		Rank   int    `json:"rank,omitempty"`
+		Color  string `json:"color,omitempty"`
+	}
+	out := []person{}
+	add := func(cs []*gmproto.Contact, ranked bool) {
+		for i, c := range cs {
+			num := c.GetNumber()
+			if num == nil || num.GetNumber() == "" || c.GetName() == "" {
+				continue
+			}
+			p := person{ID: num.GetNumber(), Name: c.GetName(), Detail: num.GetFormattedNumber(),
+				Color: c.GetAvatarHexColor()}
+			if p.Detail == "" {
+				p.Detail = num.GetNumber()
+			}
+			if ranked {
+				p.Rank = i + 1
+			}
+			out = append(out, p)
+		}
+	}
+	if top, err := b.client.ListTopContacts(); err == nil {
+		add(top.GetContacts(), true)
+	}
+	all, err := b.client.ListContacts()
+	if err != nil && len(out) == 0 {
+		return "", err
+	}
+	if err == nil {
+		add(all.GetContacts(), false)
+	}
+	bs, _ := json.Marshal(map[string]any{"people": out})
+	return string(bs), nil
+}
+
+// OpenPerson returns the conversation with the number from ListPeople (theirs, or a
+// new one Google Messages makes now) as its protojson Conversation: the same fields
+// ListConversations gives for it, so its SIM routing reads the same way.
+func (b *Bridge) OpenPerson(number string) (string, error) {
+	req := &gmproto.GetOrCreateConversationRequest{
+		Numbers: []*gmproto.ContactNumber{{MysteriousInt: 2, Number: number, Number2: number}},
+	}
+	resp, err := b.client.GetOrCreateConversation(req)
+	if err != nil {
+		return "", err
+	}
+	if resp.GetConversation() == nil {
+		return "", fmt.Errorf("no conversation (status %v)", resp.GetStatus())
+	}
+	bytes, err := protojson.Marshal(resp.GetConversation())
 	if err != nil {
 		return "", err
 	}

@@ -181,6 +181,29 @@ interface MessagingService {
     /** Messages for a conversation as JSON. cursor "" = most recent. */
     fun fetchMessages(conversationId: String, count: Long, cursor: String): String
 
+    // ---- New chat (the watch's people screen, People.kt) ---------------------
+
+    /** True when this account can start a chat with someone it has no chat with yet. */
+    val supportsNewChat: Boolean get() = false
+
+    /**
+     * The people this account can start a chat with, as JSON
+     * {"people":[{"id","name","detail","rank","chat"}]}: [id] is what [openPerson]
+     * takes, detail a short line under the name (a number, a username), rank 1 for the
+     * one written to most (0 or absent: not known), chat the id of the chat with them
+     * when the network knows there is one. Called off the main thread; may take a
+     * network round trip.
+     */
+    fun listPeople(): String = "{\"people\":[]}"
+
+    /**
+     * The chat with person [personId] (from [listPeople]): theirs if there is one,
+     * else a new one, made on the network now or by its first send. Its list entry as
+     * JSON, the conversationID at least (and whatever [sendMessage] routes by, the way
+     * [listConversations] gives it); "" or JSON with "error" when it can't.
+     */
+    fun openPerson(personId: String): String = ""
+
     /**
      * Send a text message. [replyToken] is opaque routing the service itself
      * produced (e.g. via [replyTokenFor]) and knows how to interpret; the core

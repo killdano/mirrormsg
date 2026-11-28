@@ -266,6 +266,14 @@ class DiscordService : MessagingService, ReactionRemover {
         }
     }
 
+    // ---- New chat (People.kt) -------------------------------------------------
+    // Your Discord friends; picking one opens your DM with them (made if there's none).
+    override val supportsNewChat = true
+
+    override fun listPeople(): String = bridge().listPeople()
+
+    override fun openPerson(personId: String): String = bridge().openPerson(personId)
+
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         val result = try {
             bridge().sendMessage(conversationId, text)

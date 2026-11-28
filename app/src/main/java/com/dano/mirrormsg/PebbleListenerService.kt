@@ -543,6 +543,7 @@ class PebbleListenerService : BasePebbleListenerService() {
      *  updates live (new message bumps that convo to the top). */
     suspend fun refreshConversationList() {
         try {
+            if (People.active()) return   // New chat's people on the watch: no chats to refresh
             val svc = Mirror.activeService() ?: return
             // Pin context BEFORE the fetch: an account switch mid-fetch must not
             // let this list be cached under (or streamed as) the new account's.
@@ -623,6 +624,22 @@ class PebbleListenerService : BasePebbleListenerService() {
                 LogStore.w(TAG, "Draft op $draftOp for no known chat; ignored")
                 return ReceiveResult.Ack
             }
+            // The New chat screen's draft is its filter (People.kt): it narrows the people
+            // and is never sent.
+            if (convoId == People.DRAFT_ID) {
+                if (!People.active()) return ReceiveResult.Ack
+                when (draftOp) {
+                    Schema.DRAFT_ADD -> DraftStore.append(this, convoId,
+                        (data[Schema.KEY_DRAFT_TEXT] as? PebbleDictionaryItem.Text)?.value.orEmpty())
+                    Schema.DRAFT_CLEAR -> DraftStore.set(this, convoId, "")
+                    Schema.DRAFT_GET -> { scope.launch { sendFullDraft(convoId) }; return ReceiveResult.Ack }
+                    Schema.DRAFT_SET -> if (!draftPiece(convoId, data)) return ReceiveResult.Ack
+                    else -> return ReceiveResult.Ack   // (a send: nothing to send)
+                }
+                LogStore.i(TAG, "New chat: filter now ${DraftStore.get(this, convoId).length} chars")
+                scope.launch { streamPeople() }
+                return ReceiveResult.Ack
+            }
             when (draftOp) {
                 Schema.DRAFT_ADD -> {
                     val piece = (data[Schema.KEY_DRAFT_TEXT] as? PebbleDictionaryItem.Text)?.value.orEmpty()
@@ -660,6 +677,15 @@ class PebbleListenerService : BasePebbleListenerService() {
         val diag = (data[Schema.KEY_DIAG] as? PebbleDictionaryItem.Text)?.value
         if (diag != null) {
             LogStore.i(TAG, "WATCH-DIAG: $diag")
+            return ReceiveResult.Ack
+        }
+
+        // New chat (People.kt): the switcher's top row, for switcher entry N: its people,
+        // as a list level.
+        val reqNewChat = (data[Schema.KEY_REQ_NEWCHAT] as? PebbleDictionaryItem.Int32)?.value
+        if (reqNewChat != null) {
+            LogStore.i(TAG, "Watch: New chat on switcher entry $reqNewChat")
+            scope.launch { startPeople(reqNewChat) }
             return ReceiveResult.Ack
         }
 
@@ -702,7 +728,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             if (spanCount > 0) Mirror.convoSpanCount = spanCount   // watch size (10 Basalt / 20 Emery); drives drill-arrow pad
             LogStore.i(TAG, "Watch requested convo span @$reqSpan count=$spanCount")
             scope.launch {
-                val json = (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
+                val json = if (People.active()) People.listJson(DraftStore.get(this@PebbleListenerService, People.DRAFT_ID))
+                    else (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
                     ?: Mirror.activeService()?.listContext(CONVO_CAP, Mirror.navStack.toList())
                 if (json != null) {
                     val total = rebuildConvoIndex(json)
@@ -1499,7 +1526,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             DraftStore.set(this, convoId, old.substring(0, base.coerceIn(0, old.length)) + text)
         }
         LogStore.i(TAG, "Draft from the keyboard: ${text.length} chars (mode $mode)")
-        if (mode == Schema.DSET_SEND || mode == Schema.DSET_ADD_SEND) {
+        if ((mode == Schema.DSET_SEND || mode == Schema.DSET_ADD_SEND) && convoId != People.DRAFT_ID) {
             val full = DraftStore.take(this, convoId)
             if (full.isNotBlank()) {
                 LogStore.i(TAG, "Draft send: ${full.length} chars (target=$target)")
@@ -1565,7 +1592,9 @@ class PebbleListenerService : BasePebbleListenerService() {
             val r = KbDecoder.decode(this, taps, lit, prev)
             val out = java.io.ByteArrayOutputStream()
             out.write(seq)
-            out.write((if (r.auto) Schema.KS_AUTO else 0) or (if (r.predict) Schema.KS_PREDICT else 0))
+            // On New chat's people the words are names: never swapped for dictionary words.
+            val auto = r.auto && !People.active()
+            out.write((if (auto) Schema.KS_AUTO else 0) or (if (r.predict) Schema.KS_PREDICT else 0))
             out.write(r.words.joinToString("\u001F").toByteArray(Charsets.UTF_8))
             sendImgFrame(Mirror.sender(this), mapOf(Schema.KEY_KB_SUGG to PebbleDictionaryItem.Bytes(out.toByteArray())))
             val ms = System.currentTimeMillis() - t0
@@ -1616,7 +1645,14 @@ class PebbleListenerService : BasePebbleListenerService() {
      *  indexing as KEY_REQ_OPEN), resolved against the current context's entries. */
     private suspend fun navigateContext(entry: Int) {
         try {
-            if (entry < 0) {
+            if (entry < 0 && People.active()) {
+                leavePeople()                 // Back off New chat: the account's chats again
+            } else if (entry >= 0 && People.active()) {
+                // Its "type more" / "none" row: the list again (loaded again if it failed).
+                if (People.loadFailed || People.all.isEmpty()) loadPeople()
+                streamPeople()
+                return
+            } else if (entry < 0) {
                 if (Mirror.navStack.isNotEmpty())
                     Mirror.navStack.removeAt(Mirror.navStack.size - 1)
                 else {
@@ -1643,9 +1679,141 @@ class PebbleListenerService : BasePebbleListenerService() {
         }
     }
 
+    // ---- New chat (People.kt) ------------------------------------------------------
+    // The watch's switcher starts a chat: its people as a list level (navStack's
+    // People.CTX), filtered by the screen's draft (its token: People.DRAFT_ID's),
+    // and Select on a person opens the chat with them.
+
+    /** New chat on switcher entry [idx]: that account's people, the filter empty. */
+    private suspend fun startPeople(idx: Int) {
+        try {
+            val entry = Mirror.lastSwitcherEntries.getOrNull(idx)
+            if (entry != null && (entry.serviceId != Mirror.activeServiceId ||
+                    entry.folderId != Mirror.activeTgFolder || entry.guildId != Mirror.activeDiscordGuild)) {
+                LogStore.i(TAG, "New chat: account -> entry $idx (svc=${entry.serviceId})")
+                Mirror.activeServiceId = entry.serviceId
+                Mirror.activeTgFolder = entry.folderId
+                Mirror.activeDiscordGuild = entry.guildId
+                reportServiceList()
+            }
+            DraftStore.set(this, People.DRAFT_ID, "")
+            draftChats[threadToken(People.DRAFT_ID)] = People.DRAFT_ID
+            Mirror.navStack.clear()
+            Mirror.navStack.add(People.CTX)
+            loadPeople()
+            streamPeople()
+        } catch (e: Exception) {
+            LogStore.e(TAG, "startPeople failed", e)
+        }
+    }
+
+    /** The active account's people, those it has chats with first (its list's order). */
+    private fun loadPeople() {
+        val svc = Mirror.activeService()
+        val t0 = System.currentTimeMillis()
+        val raw = try {
+            if (svc?.supportsNewChat == true) svc.listPeople() else ""
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "New chat: listPeople failed on ${svc?.id}", e)
+            ""
+        }
+        val chats = try {
+            val arr = JSONObject(Mirror.getCachedConvoJson() ?: "{}").optJSONArray("conversations")
+            (0 until (arr?.length() ?: 0)).map { arr!!.getJSONObject(it).optString("conversationID") }
+        } catch (_: Exception) { emptyList() }
+        People.load(raw, chats)
+        LogStore.i(TAG, "New chat: ${People.all.size} people on ${svc?.id} in " +
+            "${System.currentTimeMillis() - t0} ms" + (if (People.loadFailed) " (couldn't read them)" else ""))
+    }
+
+    /** The people matching the filter, as the watch's list, then the filter for its bar. */
+    private suspend fun streamPeople() {
+        if (!People.active()) return
+        val filter = DraftStore.get(this, People.DRAFT_ID)
+        streamConvos(People.listJson(filter))
+        if (!watchSendAllowed()) return
+        try {
+            sendImgFrame(Mirror.sender(this), mapOf(
+                Schema.KEY_DRAFT_OP   to PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID)),
+                Schema.KEY_DRAFT_TEXT to PebbleDictionaryItem.Text(draftForWatch(filter))
+            ))
+        } catch (e: Exception) {
+            LogStore.e(TAG, "New chat: filter not sent", e)
+        }
+    }
+
+    /** Off the people screen: its level and its filter go. */
+    private fun leavePeople() {
+        if (Mirror.navStack.lastOrNull() == People.CTX) Mirror.navStack.removeAt(Mirror.navStack.size - 1)
+        DraftStore.set(this, People.DRAFT_ID, "")
+        People.clear()
+    }
+
+    /** A network's chat entry's SIM routing (Google Messages'), null when it has none. */
+    private fun routeOf(c: JSONObject): Mirror.SimRoute? {
+        if (!c.has("defaultOutgoingID") && !c.has("simCard")) return null
+        val sp = c.optJSONObject("simCard")?.optJSONObject("SIMData")?.optJSONObject("SIMPayload")
+        return Mirror.SimRoute(c.optString("defaultOutgoingID", "2"),
+            (sp?.optInt("two", 2) ?: 2).toLong(), (sp?.optInt("SIMNumber", 2) ?: 2).toLong())
+    }
+
+    /**
+     * The person on row [row] of the people screen picked: the network gives the chat
+     * with them (theirs, or a new one), which opens on the watch (empty for a new one;
+     * its first send makes it on the network), over the account's chats (Back lands
+     * there, as from any chat).
+     */
+    private suspend fun openPersonChat(row: Int) {
+        val p = People.shown.getOrNull(row)
+        val svc = Mirror.activeService()
+        if (p == null || svc == null) {
+            LogStore.w(TAG, "New chat: no person at row $row")
+            streamPeople()
+            return
+        }
+        val t0 = System.currentTimeMillis()
+        val res = try { svc.openPerson(p.id) } catch (e: Throwable) {
+            LogStore.e(TAG, "New chat: openPerson failed on ${svc.id}", e)
+            ""
+        }
+        val c = try { JSONObject(res) } catch (_: Exception) { null }
+        val convoId = c?.optString("conversationID").orEmpty()
+        if (c == null || convoId.isEmpty()) {
+            LogStore.w(TAG, "New chat: ${svc.id} gave no chat (${(c?.optString("error") ?: c?.optString("dcError")).orEmpty().take(120)})")
+            WatchNotice.post(this, "Chat not started", "${svc.displayName} couldn't start that chat.")
+            return
+        }
+        LogStore.i(TAG, "New chat: chat opened on ${svc.id} in ${System.currentTimeMillis() - t0} ms")
+        leavePeople()
+        Mirror.currentOpenConvoId = convoId
+        Mirror.currentOpenRoute = routeOf(c)
+        Mirror.backfillExhausted.remove(convoId)
+        Mirror.currentMsgPage = 0
+        try {
+            // The account's chats under it (the level its chats live on, as a force-open's).
+            Mirror.navStack.clear()
+            Mirror.navStack.addAll(svc.forceOpenNavContext(convoId))
+            val json = (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
+                ?: svc.listContext(CONVO_CAP, Mirror.navStack.toList())
+            val total = rebuildConvoIndex(json)
+            streamConvoSpan(json, 0, total)
+            val pnRow = Mirror.convoOrder.indexOf(convoId)   // -1: a new chat, not listed yet
+            if (pnRow >= 0) Mirror.currentOpenRoute = Mirror.currentOpenRoute ?: Mirror.simRoutes.getOrNull(pnRow)
+            streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+            pushDraft(convoId)
+            val f = svc.fetchMessages(convoId, FETCH_COUNT, "")
+            val added = MessageStore.merge(this, convoId, JSONObject(f).optJSONArray("messages") ?: JSONArray())
+            if (added > 0 && Mirror.currentOpenConvoId == convoId)
+                streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+        } catch (e: Exception) {
+            LogStore.w(TAG, "New chat: the chat's messages didn't come (${e.message?.take(120)})")
+        }
+    }
+
     // ---- Open thread: store-first, then catch-up ---------------------------
 
     private suspend fun openThread(row: Int) {
+        if (People.active()) { openPersonChat(row); return }   // New chat: a person picked
         // Defensive: if the watch opens an ENTER row (bucket/server), drill instead of
         // trying to open a non-existent thread. Normally the watch sends KEY_REQ_ENTER
         // for these, so this only catches a mismatch.
@@ -4790,6 +4958,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             frame[Schema.KEY_SERVICES]       = PebbleDictionaryItem.Text(labels)
             frame[Schema.KEY_ACTIVE_SERVICE] = PebbleDictionaryItem.Int32(activeIdx)
             frame[Schema.KEY_SERVICE_FLAGS]  = PebbleDictionaryItem.Int32(serviceFlags)
+            // New chat (People.kt): the entries that can start one, the switcher's top row.
+            frame[Schema.KEY_NEWCHAT_MASK]   = PebbleDictionaryItem.Int32(Mirror.newChatMask(this, entries))
             // 1 if the active service supports reaction-send (watch uses this to
             // keep the chat put on a reaction vs jump to bottom on a message).
             val activeSvcId = entries.getOrNull(activeIdx)?.serviceId ?: Mirror.activeServiceId
@@ -4924,7 +5094,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         if (!watchSendAllowed()) return
         val arr = JSONObject(json).getJSONArray("conversations")
         val sender = Mirror.sender(this@PebbleListenerService)
-        val ownerSvc = Mirror.activeService()
+        val people = People.active()
+        val ownerSvc = if (people) null else Mirror.activeService()   // (people rows: no photos)
         val s = start.coerceIn(0, maxOf(0, total - 1))
         val end = minOf(s + slots, total)
         val len = (end - s).coerceAtLeast(0)
@@ -4939,6 +5110,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             cf[Schema.KEY_LIST_ABS]    = PebbleDictionaryItem.Int32(0)
             cf[Schema.KEY_LIST_TOTAL]  = PebbleDictionaryItem.Int32(0)
             cf[Schema.KEY_LIST_HAS_PARENT] = PebbleDictionaryItem.Int32(if (hasParent) 1 else 0)
+            if (people) cf[Schema.KEY_PEOPLE] = PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID))
             attachFirstFrameConfig(cf)
             sender.sendDataToPebble(Schema.WATCH_UUID, cf, watches = null)
             LogStore.i(TAG, "Streamed convo span (empty list, total=0) to watch")
@@ -4977,6 +5149,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         frame[Schema.KEY_LIST_ABS]    = PebbleDictionaryItem.Int32(s)
         frame[Schema.KEY_LIST_TOTAL]  = PebbleDictionaryItem.Int32(total)
         frame[Schema.KEY_LIST_HAS_PARENT] = PebbleDictionaryItem.Int32(if (hasParent) 1 else 0)
+        // New chat's people (People.kt): the screen's token, on every frame of them.
+        if (people) frame[Schema.KEY_PEOPLE] = PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID))
         attachFirstFrameConfig(frame)
         sender.sendDataToPebble(Schema.WATCH_UUID, frame, watches = null)
         LogStore.i(TAG, "Streamed convo blob [$s,${s + packed}) of $total to watch " +
