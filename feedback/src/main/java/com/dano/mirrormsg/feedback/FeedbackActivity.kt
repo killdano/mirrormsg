@@ -1,16 +1,21 @@
 package com.dano.mirrormsg.feedback
 
+import android.annotation.SuppressLint
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,7 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -39,8 +43,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mirrorapps.kit.KitColors
@@ -48,8 +56,10 @@ import com.mirrorapps.kit.LogsMode
 import com.mirrorapps.kit.feedback.FeedbackPane
 
 /**
- * The Feedback screen: MirrorMsg's header, the owner code and "Logs in bug
- * reports" settings, then the kit's Feedback chat. Test builds only.
+ * The Feedback screen, the last tab of the app's home screen: MirrorMsg's
+ * header and the home tabs (Feedback selected), the owner code and "Logs in
+ * bug reports" settings, then the kit's Feedback chat. A tap on another tab
+ * closes it, and the home screen shows that tab. Test builds only.
  */
 class FeedbackActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,7 +70,14 @@ class FeedbackActivity : ComponentActivity() {
             finish()
             return
         }
+        // A tab of the home screen: no slide in or out (below Android 14,
+        // MsgFeedback.open and showTab turn the slide off).
+        if (Build.VERSION.SDK_INT >= 34) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        }
         enableEdgeToEdge()
+        val tabs = MsgFeedback.tabs(intent)
         setContent {
             val dark = isSystemInDarkTheme()
             val scheme = if (dark) {
@@ -69,14 +86,25 @@ class FeedbackActivity : ComponentActivity() {
                 lightColorScheme(primary = MsgTheme.accent)
             }
             MaterialTheme(colorScheme = scheme) {
-                FeedbackScreen()
+                FeedbackScreen(tabs, ::showTab)
             }
+        }
+    }
+
+    /** A home tab tapped here: close, and the home screen shows it. */
+    private fun showTab(position: Int) {
+        if (isFinishing) return
+        setResult(RESULT_OK, MsgFeedback.tabResult(position))
+        finish()
+        if (Build.VERSION.SDK_INT < 34) {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
         }
     }
 }
 
 @Composable
-private fun FeedbackScreen() {
+private fun FeedbackScreen(tabs: List<String>, onTab: (Int) -> Unit) {
     val c = MsgTheme.colors()
     Column(
         modifier = Modifier
@@ -85,23 +113,106 @@ private fun FeedbackScreen() {
             .imePadding()
             .navigationBarsPadding(),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(c.accent)
-                .statusBarsPadding()
-                .padding(start = 20.dp, end = 20.dp, top = 6.dp, bottom = 18.dp),
-        ) {
-            Text("Feedback", color = c.accentFg, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-            Text(
-                "Tell us what went wrong or what you'd like",
-                color = c.accentFg.copy(alpha = 0.85f),
-                fontSize = 14.sp,
-            )
-        }
+        HomeHeader(c)
+        HomeTabs(c, tabs, onTab)
         SettingsCard(c)
         Spacer(modifier = Modifier.height(8.dp))
         FeedbackPane(modifier = Modifier.weight(1f))
+    }
+}
+
+// The header and tab row copy MainActivity.renderHome, which draws them with
+// Views: the same text, colours and sizes, its whole-pixel dp, its status bar
+// height and TextView's font padding, so they don't move when the tab changes.
+
+/** Text laid out like a TextView's. */
+@Suppress("DEPRECATION")
+private val ViewText = TextStyle(platformStyle = PlatformTextStyle(includeFontPadding = true))
+
+/** MainActivity's dp(): whole pixels, rounded down. */
+@Composable
+private fun vdp(v: Int): Dp {
+    val density = LocalDensity.current
+    return with(density) { (v * density.density).toInt().toDp() }
+}
+
+/** MainActivity's statusBarHeight(). */
+@SuppressLint("DiscouragedApi", "InternalInsetResource")
+@Composable
+private fun statusBarHeight(): Dp {
+    val res = LocalContext.current.resources
+    val id = res.getIdentifier("status_bar_height", "dimen", "android")
+    return if (id > 0) with(LocalDensity.current) { res.getDimensionPixelSize(id).toDp() } else vdp(28)
+}
+
+@Composable
+private fun HomeHeader(c: KitColors) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(c.accent)
+            .padding(start = vdp(20), end = vdp(20), top = statusBarHeight() + vdp(6), bottom = vdp(18)),
+    ) {
+        Text(
+            "MirrorMsg",
+            color = c.accentFg,
+            fontSize = 26.sp,
+            fontWeight = FontWeight.Bold,
+            style = ViewText,
+        )
+        Text(
+            "Messages on your Pebble",
+            color = c.accentFg.copy(alpha = 0.85f),
+            fontSize = 14.sp,
+            style = ViewText,
+        )
+    }
+}
+
+/** The home tabs, [tabs] then Feedback (selected); a tap on one calls [onTab] with its position. */
+@Composable
+private fun HomeTabs(c: KitColors, tabs: List<String>, onTab: (Int) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = vdp(16), top = vdp(16), end = vdp(16), bottom = vdp(8)),
+    ) {
+        tabs.forEachIndexed { i, label ->
+            HomeTab(c, label, selected = false, onClick = { onTab(i) })
+            Spacer(modifier = Modifier.width(vdp(6)))
+        }
+        HomeTab(c, "Feedback", selected = true, onClick = null)
+    }
+}
+
+@Composable
+private fun RowScope.HomeTab(c: KitColors, label: String, selected: Boolean, onClick: (() -> Unit)?) {
+    val shape = RoundedCornerShape(vdp(10))
+    val stroke = vdp(1)
+    var modifier = Modifier
+        .weight(1f)
+        .clip(shape)
+        .background(if (selected) c.accent else c.cardBg)
+    if (!selected) modifier = modifier.border(stroke, c.cardDivider, shape)
+    if (onClick != null) {
+        modifier = modifier.clickable(
+            interactionSource = remember { MutableInteractionSource() },
+            indication = null,
+            onClick = onClick,
+        )
+    }
+    Box(
+        modifier = modifier.padding(horizontal = vdp(4), vertical = vdp(14)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = if (selected) c.accentFg else c.fg,
+            fontSize = 14.sp,
+            maxLines = 1,
+            softWrap = false,
+            style = ViewText,
+        )
     }
 }
 
@@ -114,7 +225,7 @@ private fun SettingsCard(c: KitColors) {
 
     Column(
         modifier = Modifier
-            .padding(start = 16.dp, end = 16.dp, top = 12.dp)
+            .padding(start = 16.dp, end = 16.dp, top = 8.dp)
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(c.cardBg)
