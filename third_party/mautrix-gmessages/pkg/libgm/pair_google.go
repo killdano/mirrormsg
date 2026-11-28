@@ -41,6 +41,7 @@ import (
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/util/random"
 	"golang.org/x/crypto/hkdf"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
@@ -493,7 +494,17 @@ func (c *Client) cancelGaiaPairing(sess *PairingSession) error {
 	})
 }
 
-func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSession, action gmproto.ActionType, msg []byte) (*gmproto.GaiaPairingResponseContainer, error) {
+// MirrorMsg backport from v0.2609.0 (see MIRRORMSG-PATCH.md at the module root).
+// Since September 2026 Google rejects a Google-account pairing's client-finished
+// message that lacks GaiaPairingRequestContainer field 8 (privateAPIConfirmation)
+// with error 3/32, CLIENT_ATTESTATION_MISSING, right after the emoji is shown.
+// v0.2609.0 sends this text in that field. v0.2605.0's gmproto has no such field,
+// so newGaiaPairingRequest appends it as an unknown field, which proto.Marshal
+// writes after the known ones: the same bytes v0.2609.0's generated code writes.
+const gaiaPrivateAPIConfirmationField = 8
+const gaiaPrivateAPIConfirmation = "This is an undocumented API. Use or access of undocumented Google APIs without express authorization is prohibited per the Google API Terms of Service (https://developers.google.com/terms)."
+
+func newGaiaPairingRequest(sess *PairingSession, action gmproto.ActionType, msg []byte) (*gmproto.GaiaPairingRequestContainer, gmproto.MessageType) {
 	reqContainer := &gmproto.GaiaPairingRequestContainer{
 		PairingAttemptID: sess.UUID.String(),
 		BrowserDetails:   util.BrowserDetailsMessage,
@@ -503,10 +514,18 @@ func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSessio
 	msgType := gmproto.MessageType_GAIA_2
 	if action == gmproto.ActionType_CREATE_GAIA_PAIRING_CLIENT_FINISHED {
 		msgType = gmproto.MessageType_BUGLE_MESSAGE
+		field := protowire.AppendTag(nil, gaiaPrivateAPIConfirmationField, protowire.BytesType)
+		field = protowire.AppendString(field, gaiaPrivateAPIConfirmation)
+		reqContainer.ProtoReflect().SetUnknown(field)
 	} else {
 		reqContainer.ProposedVerificationCodeVersion = 1
 		reqContainer.ProposedKeyDerivationVersion = 1
 	}
+	return reqContainer, msgType
+}
+
+func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSession, action gmproto.ActionType, msg []byte) (*gmproto.GaiaPairingResponseContainer, error) {
+	reqContainer, msgType := newGaiaPairingRequest(sess, action, msg)
 	respCh, err := c.sessionHandler.sendAsyncMessage(SendMessageParams{
 		Action:      action,
 		Data:        reqContainer,
