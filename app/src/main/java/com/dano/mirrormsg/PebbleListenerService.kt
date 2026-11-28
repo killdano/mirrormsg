@@ -5042,7 +5042,11 @@ class PebbleListenerService : BasePebbleListenerService() {
         Mirror.navContexts.clear()
         for (i in 0 until total) {
             val c = arr.getJSONObject(i)
-            val convoId = c.optString("conversationID")
+            // Google Messages can send a chat's id only in someKindOfGroupID (the bridge
+            // fills conversationID from it now; a list cached before that still lacks it).
+            val convoId = c.optString("conversationID").ifEmpty {
+                c.optJSONObject("someKindOfGroupID")?.optString("conversationID").orEmpty()
+            }
             Mirror.convoOrder.add(convoId)
             // Navigation kind: ENTER (bucket/server/folder) vs OPEN (a real chat).
             // Absent navKind => OPEN, so flat services need no change.

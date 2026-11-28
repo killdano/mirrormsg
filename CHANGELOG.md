@@ -14,3 +14,4 @@
 - The Emoji substitution setting shows only for the Pebble Time and Time Steel. The Time 2 shows every emoji as sent.
 - Google Messages pairing no longer stops with "Pairing didn't finish" right after the emoji appears.
 - Image quality is now one setting, from Faster to Sharper. Tall pictures no longer come out squashed.
+- Google Messages chats open with their messages again instead of an empty chat.
