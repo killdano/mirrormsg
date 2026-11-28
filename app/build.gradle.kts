@@ -82,6 +82,10 @@ android {
             }
         }
     }
+    buildFeatures {
+        // BuildConfig.DEBUG: which callers' certificates the Dash Cam hand-off accepts.
+        buildConfig = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -111,6 +115,14 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
+    // The Feedback screen (feedback/, with mirrorapps-kit): test builds only.
+    // Release builds get none of it: no Compose, no microphone permission.
+    debugImplementation(project(":feedback"))
+    // The test-build updater (kit/updater/; testbuild/TestBuilds.kt in src/debug)
+    // and WorkManager for its 3-hourly check: test builds only, like Feedback. Its
+    // install permissions are in src/debug/AndroidManifest.xml.
+    debugImplementation(project(":kit-updater"))
+    debugImplementation("androidx.work:work-runtime-ktx:2.10.1")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

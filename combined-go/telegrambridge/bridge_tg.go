@@ -1910,6 +1910,70 @@ func (b *Bridge) cachePeer(p tg.InputPeerClass) string {
 	}
 }
 
+// ListPeople returns the people a new chat can start with (the watch's New chat):
+// the account's Telegram contacts, the ones written to most ranked first
+// (contacts.getTopPeers), as {"people":[{"id","name","detail","rank"}]}. id is
+// the 1:1 chat's conversationID (tg:user:<id>), whose access hash is cached here so
+// FetchMessages and SendMessage reach it with or without a dialog. Runs on the pump.
+func (b *Bridge) ListPeople() string {
+	r := b.call(30*time.Second, func(ctx context.Context) string {
+		api := b.client.API()
+		res, err := api.ContactsGetContacts(ctx, 0)
+		if err != nil {
+			return errJSON("getContacts: " + err.Error())
+		}
+		cs, ok := res.(*tg.ContactsContacts)
+		if !ok {
+			return errJSON("getContacts: not modified")
+		}
+		top := map[int64]int{}
+		if tp, err := api.ContactsGetTopPeers(ctx, &tg.ContactsGetTopPeersRequest{Correspondents: true, Limit: 50}); err == nil {
+			if t, ok := tp.(*tg.ContactsTopPeers); ok {
+				for _, cat := range t.Categories {
+					for i, p := range cat.Peers {
+						if pu, ok := p.Peer.(*tg.PeerUser); ok {
+							if _, had := top[pu.UserID]; !had {
+								top[pu.UserID] = i + 1
+							}
+						}
+					}
+				}
+			}
+		}
+		type person struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Detail string `json:"detail,omitempty"`
+			Rank   int    `json:"rank,omitempty"`
+		}
+		out := make([]person, 0, len(cs.Users))
+		for _, uc := range cs.Users {
+			u, ok := uc.(*tg.User)
+			if !ok || u.Self || u.Bot || u.Deleted {
+				continue
+			}
+			name := strings.TrimSpace(u.FirstName + " " + u.LastName)
+			if name == "" {
+				continue
+			}
+			cid := b.cachePeer(&tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash})
+			detail := ""
+			if u.Username != "" {
+				detail = "@" + u.Username
+			} else if u.Phone != "" {
+				detail = "+" + u.Phone
+			}
+			out = append(out, person{ID: cid, Name: name, Detail: detail, Rank: top[u.ID]})
+		}
+		bs, _ := json.Marshal(map[string]any{"people": out})
+		return string(bs)
+	})
+	if !strings.HasPrefix(r, "{") {
+		return errJSON(r)
+	}
+	return r
+}
+
 // ListFolders returns the account's chat folders as sub-accounts:
 // {"folders":[{id,title,chats:[conversationID,...]}]}. Each folder's chats have
 // their access hashes cached here, so they stay openable regardless of archive

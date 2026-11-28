@@ -52,6 +52,28 @@ object Mirror {
     // watch-swap self-corrects; both platforms have only two values, so brief
     // staleness is harmless (one list render at the old pad).
     @Volatile var watchDisplayW: Int = 0
+    // The same width, kept across restarts (0 = never reported). Only the Emoji
+    // substitution setting reads it: the Time / Time Steel's font (144 wide) lacks
+    // many emoji, while the Time 2 and Round 2 draw them all. Kept so that switch is
+    // right as soon as the app starts, not only after this run's first image request.
+    @Volatile var lastWatchW: Int = 0
+    /** Told when the watch's reported width changes (first report, or a watch swap): the Settings screen. */
+    @Volatile var onWatchWidthChanged: (() -> Unit)? = null
+
+    /** Whether Emoji substitution applies to this watch: the Time / Time Steel, or a
+     *  width not reported yet. Hidden and off on anything wider. */
+    fun emojiSubForWatch(): Boolean = lastWatchW <= 144
+
+    /** A request reported the watch's display width. */
+    fun noteWatchWidth(ctx: Context, w: Int) {
+        watchDisplayW = w
+        if (w == lastWatchW) return
+        lastWatchW = w
+        EmojiSub.watchDrawsAll = !emojiSubForWatch()
+        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
+            .edit().putInt("lastWatchW", w).apply()
+        onWatchWidthChanged?.invoke()
+    }
 
     // The watch's MESSAGE window size (20 Basalt / 40 Emery), cached from the count it
     // sends on thread-open and message-span requests. Newest-span pushes (thread open,
@@ -270,6 +292,17 @@ object Mirror {
 
     // Beeper grouping bitmask over the entries (bit i set if entry i is a
     // Beeper-backed real account; folder sub-accounts are native Telegram, so 0).
+    /** New chat (People.kt): bit i set when switcher entry i can start a chat (an
+     *  account's own entry: not a Telegram folder or a Discord server). */
+    fun newChatMask(ctx: Context, entries: List<SwitcherEntry>): Int {
+        var mask = 0
+        entries.forEachIndexed { i, e ->
+            val ok = try { ServiceRegistry.byId(ctx, e.serviceId)?.supportsNewChat == true } catch (_: Throwable) { false }
+            if (i < 8 && ok && e.folderId == 0 && e.guildId.isEmpty()) mask = mask or (1 shl i)
+        }
+        return mask
+    }
+
     fun switcherFlags(ctx: Context, entries: List<SwitcherEntry>): Int {
         var flags = 0
         entries.forEachIndexed { i, e ->
@@ -387,76 +420,76 @@ object Mirror {
     // Wire key/type unchanged (KEY_HEAP_GUARD, int bytes). Default 800 B.
     @Volatile var heapGuard: Int = 800
 
-    // ---- Image quality dials (phone-side encoder config) ------------------
-    // Colour caps are a COUNT (2/4/16) = the max palette size the encoder may use
-    // for that path; the detector picks the smallest depth that still looks right
-    // UP TO this cap. Coverages are an int percent (10-100) = how much of the image
-    // (by colour area) the significant-colour count must cover before the rarest
-    // colours are dropped — LOWER = complex images settle for fewer colours more
-    // often (smaller files), HIGHER = keep more colours. Pushed into the Go encoder
-    // via Watchimage.setConfig at startup and on change. Defaults match the encoder.
-    // Both image types get the full 16-colour ceiling. Thumbnails were capped at
-    // 4 to keep the churny, dynamically-allocated previews cheap; with the
-    // coverage figures below the analyzer still drops simple thumbnails to a
-    // lower depth on its own, so the cap no longer has to do that job bluntly.
-    // (A 16-colour thumbnail costs w*h/2 bytes of watch heap instead of w*h/4 —
-    // the analyzer keeps that from being the common case.)
-    @Volatile var imgThumbCap: Int = 16      // colours: 2/4/16
-    @Volatile var imgFullCap: Int = 16       // colours: 2/4/16
-    // Coverage = the share of pixel AREA the "significant colour" count must
-    // explain. Higher means rare colours still count, so the analyzer picks a
-    // higher depth. 94% for the full view keeps photographic detail; 72% for
-    // thumbnails lets genuinely simple previews fall to a cheaper depth.
-    @Volatile var imgThumbCoverage: Int = 72 // percent 10-100
-    @Volatile var imgFullCoverage: Int = 94  // percent 10-100
+    // ---- Image quality: one setting, "Pictures" ----------------------------
+    // Settings > Image quality has one slider with three stops. Each sets every
+    // encoder dial in pushImageConfig; nothing else is a user setting any more:
+    // how many colours a picture uses (2/4/16), its size (from the room the watch
+    // reports) and whether it goes compressed or plain are picked per picture.
+    //   Faster:   no dithering (pictures, GIFs, video), previews use at most 4
+    //             colours. Smaller transfers; skies and shadows show bands.
+    //   Balanced: the old defaults (16 colours, 72% / 94% coverage, dithered).
+    //   Sharper:  as Balanced, but previews and opened pictures keep every colour
+    //             (100% coverage), so screenshot previews aren't cut to 2.
+    // Compression of the opened picture is always on: the phone sends whichever of
+    // compressed or plain is smaller, so it's never worse than off.
+    const val IMG_FASTER = 0
+    const val IMG_BALANCED = 1
+    const val IMG_SHARPER = 2
+    val IMG_QUALITY_NAMES = listOf("Faster", "Balanced", "Sharper")
+    @Volatile var imgQuality: Int = IMG_BALANCED
 
-    // Phase 2: heap-saving row compression on the full-size (enhanced) view only.
-    // The watch keeps the image compressed in RAM and expands one scanline at a time
-    // into the framebuffer, so a large image costs its compressed size in heap, not
-    // its decoded size. Enhanced-view ONLY by design: thumbnails are tiny, cached as
-    // decoded bitmaps, and redraw every scroll frame — decode-on-draw there would
-    // spend CPU per frame to save a few hundred bytes and add resident decoder code,
-    // a net loss (that's why there's no "compress thumbnails" option). Opt-in; the
-    // phone ships raw when an image doesn't compress, so it's never worse than off.
-    @Volatile var imgCompress: Boolean = true
+    // The eight settings "Pictures" replaced (the first start after the update
+    // carries them over once, then deletes them; see imgQualityFromOld).
+    private val OLD_IMG_KEYS = listOf("imgThumbCap", "imgFullCap", "imgThumbCoverage",
+        "imgFullCoverage", "imgCompress", "imgDither", "imgDitherEdge", "imgDitherStrength",
+        "imgDitherCompress", "imgDitherIntensity")
 
-    // Adaptive dithering (opt-in). Reconstructs smooth gradients against the chosen
-    // palette so few-colour images look like they have more colours, at a
-    // compression cost — that's why it's opt-in. Flat fills and hard edges are left
-    // crisp. Three dials: edge protection (keep boundaries sharp), strength (how
-    // readily a region counts as a ditherable gradient), intensity (how strong the
-    // dither texture is — lower = softer, cleaner, more compressible). The slider
-    // UI shows friendly 0-100 values; these are mapped to the encoder's internal
-    // squared-distance thresholds in pushImageConfig.
-    // ON by default. Without error diffusion a 16-colour palette shows hard
-    // banding on any photographic gradient (measured: ~28x worse perceptual
-    // error than whole-image dithering on a real dark photo).
-    @Volatile var imgDither: Boolean = true
-    // Compression bias: how much of the image is EXCLUDED from dithering to keep
-    // it row-compressible. 0 = dither every pixel (smoothest gradients, largest
-    // transfers); higher = protect more flat regions and hard edges, so long runs
-    // of identical pixels survive for the compressor.
-    //
-    // This single dial replaced three controls ("edge protection", "dither
-    // strength", and a "dither entire image" switch) that were really one idea
-    // wearing three hats — and whose interaction hid a cliff: the strength slider
-    // only disabled edge protection at exactly 100, so 99 and 100 ran visibly
-    // different algorithms. It drives both encoder thresholds together, so the
-    // range is continuous end to end.
-    //
-    // Only meaningful when imgCompress is on; with compression off there is
-    // nothing to preserve, so the encoder always dithers the whole image and the
-    // UI hides this control entirely.
-    @Volatile var imgDitherCompress: Int = 0      // 0-100 UI (compression bias)
-    @Volatile var imgDitherEdge: Int = 50         // legacy, no longer surfaced in the UI
-    @Volatile var imgDitherStrength: Int = 100     // legacy, no longer surfaced in the UI
-    @Volatile var imgDitherIntensity: Int = 100    // 0-100 UI (diffusion strength)
+    /**
+     * The "Pictures" stop closest to the old Image quality settings (their old
+     * defaults give Balanced). Faster when any of them already meant "smaller and
+     * plainer": dithering off, dither strength below 50, "Keep images compressible"
+     * above 0 with compression on, or a colour limit below 16. Otherwise Sharper
+     * when either colours slider was raised above its default. Otherwise Balanced.
+     */
+    internal fun imgQualityFromOld(thumbCap: Int, fullCap: Int, thumbCoverage: Int,
+                                   fullCoverage: Int, compress: Boolean, dither: Boolean,
+                                   ditherCompress: Int, ditherIntensity: Int): Int = when {
+        !dither -> IMG_FASTER
+        ditherIntensity < 50 -> IMG_FASTER
+        compress && ditherCompress > 0 -> IMG_FASTER
+        thumbCap == 2 || thumbCap == 4 || fullCap == 2 || fullCap == 4 -> IMG_FASTER
+        thumbCoverage > 72 || fullCoverage > 94 -> IMG_SHARPER
+        else -> IMG_BALANCED
+    }
+
+    private fun loadImgQuality(prefs: android.content.SharedPreferences): Int {
+        if (prefs.contains("imgQuality")) {
+            return prefs.getInt("imgQuality", IMG_BALANCED).coerceIn(IMG_FASTER, IMG_SHARPER)
+        }
+        // First start since the update: carry the old settings over, once.
+        val q = imgQualityFromOld(
+            prefs.getInt("imgThumbCap", 16),
+            prefs.getInt("imgFullCap", 16),
+            prefs.getInt("imgThumbCoverage", 72).coerceIn(10, 100),
+            prefs.getInt("imgFullCoverage", 94).coerceIn(10, 100),
+            prefs.getBoolean("imgCompress", true),
+            prefs.getBoolean("imgDither", true),
+            prefs.getInt("imgDitherCompress", 0).coerceIn(0, 100),
+            prefs.getInt("imgDitherIntensity", 100).coerceIn(0, 100))
+        val ed = prefs.edit().putInt("imgQuality", q)
+        OLD_IMG_KEYS.forEach { ed.remove(it) }
+        ed.apply()
+        return q
+    }
 
     fun loadSettings(ctx: Context) {
         val prefs = ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
         nightMode = prefs.getBoolean("nightMode", false)
+        watchCalls = prefs.getBoolean("watchCalls", false)
         emojiSubstitution = prefs.getBoolean("emojiSubstitution", false)
         EmojiSub.enabled = emojiSubstitution
+        lastWatchW = prefs.getInt("lastWatchW", 0)
+        EmojiSub.watchDrawsAll = !emojiSubForWatch()
         videoSoundLow = prefs.getBoolean("videoSoundLow", false)
         pushTone = prefs.getInt("pushTone", 1).coerceIn(0, TONE_NAMES.size - 1)
         lastTone = prefs.getInt("lastTone", if (pushTone > 0) pushTone else 1)
@@ -467,19 +500,7 @@ object Mirror {
         hybridIanWhenOpen = prefs.getBoolean("hybridIanWhenOpen", false)
         thumbLimit = prefs.getInt("thumbLimit", 4).coerceIn(0, 8)
         heapGuard = prefs.getInt("heapGuard", 800)
-        imgThumbCap = prefs.getInt("imgThumbCap", 16)
-        imgFullCap = prefs.getInt("imgFullCap", 16)
-        imgThumbCoverage = prefs.getInt("imgThumbCoverage", 72).coerceIn(10, 100)
-        imgFullCoverage = prefs.getInt("imgFullCoverage", 94).coerceIn(10, 100)
-        // Compression ON by default: dithered photos row-compress poorly, but
-        // flat/graphic images compress hard, and the encoder ships whichever of
-        // raw/compressed is smaller — so this is never worse than off.
-        imgCompress = prefs.getBoolean("imgCompress", true)
-        imgDither = prefs.getBoolean("imgDither", true)
-        imgDitherEdge = prefs.getInt("imgDitherEdge", 50).coerceIn(0, 100)
-        imgDitherStrength = prefs.getInt("imgDitherStrength", 100).coerceIn(0, 100)
-        imgDitherCompress = prefs.getInt("imgDitherCompress", 0).coerceIn(0, 100)
-        imgDitherIntensity = prefs.getInt("imgDitherIntensity", 100).coerceIn(0, 100)
+        imgQuality = loadImgQuality(prefs)
         pushImageConfig()
         accountNumber = prefs.getString("accountNumber", "") ?: ""
         _activeServiceId = prefs.getString("activeServiceId", "google") ?: "google"
@@ -494,100 +515,34 @@ object Mirror {
             .edit().putInt("thumbLimit", thumbLimit).apply()
     }
 
-    // ---- Image quality setters --------------------------------------------
-    // Each persists and immediately re-pushes the full config to the encoder so a
-    // dial change applies to the very next image (no restart). Caps clamp to the
-    // three watch-supported palette sizes; coverages to 10-100%.
-    private fun persistInt(ctx: Context, key: String, v: Int) {
+    /** Settings > Image quality > Pictures. Applies to the very next picture (no restart). */
+    fun setImgQuality(ctx: Context, q: Int) {
+        imgQuality = q.coerceIn(IMG_FASTER, IMG_SHARPER)
         ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt(key, v).apply()
-    }
-
-    fun setImgThumbCap(ctx: Context, colors: Int) {
-        imgThumbCap = if (colors == 2 || colors == 4 || colors == 16) colors else 16
-        persistInt(ctx, "imgThumbCap", imgThumbCap); pushImageConfig()
-    }
-
-    fun setImgFullCap(ctx: Context, colors: Int) {
-        imgFullCap = if (colors == 2 || colors == 4 || colors == 16) colors else 16
-        persistInt(ctx, "imgFullCap", imgFullCap); pushImageConfig()
-    }
-
-    fun setImgThumbCoverage(ctx: Context, percent: Int) {
-        imgThumbCoverage = percent.coerceIn(10, 100)
-        persistInt(ctx, "imgThumbCoverage", imgThumbCoverage); pushImageConfig()
-    }
-
-    fun setImgFullCoverage(ctx: Context, percent: Int) {
-        imgFullCoverage = percent.coerceIn(10, 100)
-        persistInt(ctx, "imgFullCoverage", imgFullCoverage); pushImageConfig()
-    }
-
-    fun setImgCompress(ctx: Context, on: Boolean) {
-        imgCompress = on
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putBoolean("imgCompress", on).apply()
-        pushImageConfig() // CompressFit sizing follows this toggle in the encoder
-    }
-
-    fun setImgDither(ctx: Context, on: Boolean) {
-        imgDither = on
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putBoolean("imgDither", on).apply()
+            .edit().putInt("imgQuality", imgQuality).apply()
         pushImageConfig()
     }
 
-    fun setImgDitherEdge(ctx: Context, v: Int) {
-        imgDitherEdge = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherEdge", imgDitherEdge).apply()
-        pushImageConfig()
-    }
-
-    fun setImgDitherStrength(ctx: Context, v: Int) {
-        imgDitherStrength = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherStrength", imgDitherStrength).apply()
-        pushImageConfig()
-    }
-
-    fun setImgDitherCompress(ctx: Context, v: Int) {
-        imgDitherCompress = v.coerceIn(0, 100)
-        persistInt(ctx, "imgDitherCompress", imgDitherCompress); pushImageConfig()
-    }
-
-    fun setImgDitherIntensity(ctx: Context, v: Int) {
-        imgDitherIntensity = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherIntensity", imgDitherIntensity).apply()
-        pushImageConfig()
-    }
-
-    // Push the four dials into the Go encoder. Coverage percent -> fraction. Safe
-    // to call anytime; the Go side clamps anything out of range to its defaults.
+    // Push the encoder dials for the current stop into the Go encoder. Safe to call
+    // anytime; the Go side clamps anything out of range to its defaults. The GIF
+    // and video encoders read the colour caps and the dither switch from here too.
     fun pushImageConfig() {
+        val faster = imgQuality == IMG_FASTER
+        val sharper = imgQuality == IMG_SHARPER
         try {
-            // One dial -> both encoder thresholds, scaled together so the range is
-            // continuous (no magic value, no cliff).
-            //   gradient threshold: 0 at bias 0 (every pixel dithers) up to 3000
-            //     (only strong gradients dither, flat areas left solid).
-            //   edge threshold: a concentrated jump >= this counts as an edge and
-            //     is kept crisp AND excluded from diffusion. Huge at bias 0 so
-            //     nothing qualifies; tight at bias 100 so edges are protected.
-            // Compression off => nothing to preserve => always dither everything.
-            val bias = if (imgCompress) imgDitherCompress else 0
-            val gradThresh = (bias * 30).coerceIn(0, 3000)
-            val edgeThresh = (110000 - bias * 1000).coerceIn(10000, 110000)
             fi.mirrormsg.mirrorbridge.Mirrorbridge.setImageConfig(
-                imgThumbCoverage / 100.0,
-                imgFullCoverage / 100.0,
-                imgThumbCap.toLong(),
-                imgFullCap.toLong(),
-                imgCompress,
-                imgDither,
-                edgeThresh.toLong(),
-                gradThresh.toLong(),
-                imgDitherIntensity.toLong(),
+                if (sharper) 1.0 else 0.72,       // preview coverage
+                if (sharper) 1.0 else 0.94,       // opened-picture coverage
+                if (faster) 4L else 16L,          // preview colour cap
+                16L,                              // opened-picture colour cap
+                true,                             // size opened pictures for compression
+                !faster,                          // dither
+                // Dither every pixel that needs it: no edge or flat-area exclusion
+                // (what the old "Keep images compressible" did at 0), at full
+                // strength (the old "Dither strength" at 100).
+                110000L,                          // edge threshold
+                0L,                               // gradient threshold
+                100L,                             // dither intensity
             )
         } catch (e: Throwable) {
             // Encoder not loaded yet / older AAR without setImageConfig — harmless,
@@ -635,6 +590,16 @@ object Mirror {
         quickReplies = if (clean.isEmpty()) DEFAULT_QUICK_REPLIES else clean
         ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
             .edit().putString("quickReplies", quickReplies.joinToString("\u001e")).apply()
+    }
+
+    // Calls from the watch (Calls.kt): a Call row on the watch for chats that can be
+    // called. Off until switched on in Settings (which asks for the permissions).
+    @Volatile var watchCalls: Boolean = false
+
+    fun setWatchCalls(ctx: Context, enabled: Boolean) {
+        watchCalls = enabled
+        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
+            .edit().putBoolean("watchCalls", enabled).apply()
     }
 
     fun setNightMode(ctx: Context, enabled: Boolean) {
@@ -726,6 +691,20 @@ object Mirror {
         convoListMem[forKey] = json
         val ctx = appContext ?: return
         try { convoListFile(ctx, forKey).writeText(json) } catch (_: Exception) {}
+    }
+
+    /** Forget every cached root list of one account (all its folder and guild
+     *  contexts), memory and disk. Called on logout, so a later login (maybe to
+     *  another account on the same network) never shows the old account's list. */
+    fun dropCachedConvoLists(ctx: Context, serviceId: String) {
+        val prefix = "$serviceId|"
+        convoListMem.keys.removeAll { it.startsWith(prefix) }
+        // Disk names are convoListFile(key): "<id>|<folder>|<guild>" made file-safe.
+        val safeId = prefix.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val name = Regex("^" + Regex.escape("convo_list_$safeId") + "-?\\d+_\\d*\\.json$")
+        try {
+            ctx.filesDir.listFiles()?.forEach { f -> if (name.matches(f.name)) f.delete() }
+        } catch (_: Exception) {}
     }
 
     /** Force the next list read for the ACTIVE context to skip memory (call on
@@ -837,6 +816,9 @@ object Schema {
                                      //   one item at a time in the detail view (step 88)
     const val IMGCAP_ROOMS = 8       //   reply rooms (step 99): a row's room (blob field
                                      //   12), KEY_REQ_ROOM / KEY_ROOM_BACK
+    const val IMGCAP_CALL = 16       //   calls: a Call row in its reply menu (KEY_THREAD_CALL)
+    const val IMGCAP_REACT = 32      //   reactions come only as KEY_REQ_REACT: an emoji in
+                                     //   a reply (KEY_REPLY_TEXT) is text, never a reaction
     val KEY_GIF_TABLE: UInt = 113u   // phone->watch (GIF_START): per frame [u16 bytes]
                                      //   [u16 delay ms][u8 bit0 delta, bit1 comp]; then
                                      //   KEY_GIF_FRAME -1 chunks, KEY_IMG_SEQ = offset
@@ -1069,6 +1051,24 @@ object Schema {
                                         // each from the low end, how many in bits 12-15
     val KEY_REQ_ACTION: UInt      = 145u // watch->phone: action (v shr 16) on message
                                         // (v and 0xFFFF) of the chat on screen
+    // Calls from the watch (Calls.kt): a Call row in the watch's reply menu, under Emoji.
+    val KEY_THREAD_CALL: UInt     = 148u // phone->watch (every thread frame of a chat Calls
+                                        // can call, to a watch that says IMGCAP_CALL): 1
+    val KEY_REQ_CALL: UInt        = 149u // watch->phone: call the chat on screen; v = its
+                                        // thread token (a stale one calls no one)
+    // Reactions from the watch's reply menu (its React row, and the emoji list it opens):
+    // asked for outright, so a reaction never goes as a message.
+    val KEY_REQ_REACT: UInt       = 150u // watch->phone (text): react with this emoji to
+                                        // message KEY_REPLY_TO_INDEX (with KEY_REQ_HASH) of
+                                        // the chat KEY_DRAFT_TOK names
+    // New chat (People.kt): the watch's switcher starts a chat with someone on an account.
+    // The people come as a list level (a BACK row above them), filtered by the screen's
+    // own draft (its token, People.TOKEN), and Select on one opens the chat with them.
+    val KEY_NEWCHAT_MASK: UInt    = 151u // phone->watch (with KEY_SERVICES): bit i set =
+                                        // switcher entry i can start chats
+    val KEY_REQ_NEWCHAT: UInt     = 152u // watch->phone: the people of switcher entry v
+    val KEY_PEOPLE: UInt          = 153u // phone->watch (every list frame of the people):
+                                        // the screen's token, which its draft ops name
     val KEY_THREAD_GREW: UInt     = 138u // phone->watch (OP_MSG of a feed, step 95): these rows
                                         // were fetched in the background and go below what
                                         // the watch holds, its view unmoved (KEY_LIST_ABS =

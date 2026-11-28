@@ -803,16 +803,16 @@ func Encode(rawBytes []byte, opts Options) (string, error) {
 
 	dstW, dstH := sizeFor(src.Bounds().Dx(), src.Bounds().Dy(), opts, depth)
 
-	// CompressFit (enhanced only): grow to full width and size HEIGHT so the
-	// compressed estimate fits MaxBytes — a compressible image can be taller than
-	// its raw-fit size. We start at the raw-fit size (guaranteed to fit even if
-	// incompressible) and grow toward natural size while the compressed estimate
-	// stays under budget; then trim back if an overshoot. Source is decoded once;
-	// each trial only re-scales+quantizes in-memory (no re-download). The estimate
-	// is byte-exact with the phone's compressor, so the result is guaranteed to fit.
+	// CompressFit (enhanced only): a compressible image can be bigger than its
+	// raw-fit size for the same budget. Start at the raw-fit size (fits even when
+	// it doesn't compress, because the phone then sends it raw) and grow BOTH
+	// sides together toward the natural size while the compressed estimate stays
+	// under budget, so the picture keeps its shape. Source is decoded once; each
+	// trial only re-scales+quantizes in memory. The estimate is byte-exact with
+	// the phone's compressor, so the result is guaranteed to fit.
 	estCompressed := 0
 	if opts.CompressFit && opts.Palettize && opts.MaxBytes > 0 {
-		dstW, dstH, estCompressed = fitCompressed(src, opts, depth)
+		dstW, dstH, estCompressed = fitCompressed(src, opts, depth, dstW, dstH)
 	}
 
 	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
@@ -1236,14 +1236,20 @@ func sizeFor(srcW, srcH int, opts Options, depth BitDepth) (int, int) {
 }
 
 // fitCompressed sizes the enhanced image so its COMPRESSED estimate fits
-// opts.MaxBytes. It scales the source to full width (MaxW), then binary-searches
-// the height: the largest height whose compressed estimate is <= MaxBytes. Because
-// compression is content-dependent, we measure (estimate) at each trial height
-// rather than predict a ratio. Returns (w, h, estCompressedAtThatSize). The source
-// is scaled+quantized per trial in-memory only. Guaranteed: the returned size's
-// compressed estimate <= MaxBytes (or the smallest possible size if even 1 row
-// overflows, which can't happen for real budgets).
-func fitCompressed(src image.Image, opts Options, depth BitDepth) (int, int, int) {
+// opts.MaxBytes, keeping the image's shape: width and height scale together.
+// It takes the natural size (width capped at MaxW) when that fits; otherwise it
+// binary-searches the width between the raw-fit size (rawW x rawH, from sizeFor)
+// and the natural width, the height following the aspect ratio, for the largest
+// size whose compressed estimate is <= MaxBytes. Because compression is
+// content-dependent, each trial is measured, not predicted. Returns (w, h,
+// estCompressedAtThatSize); the estimate is 0 when no size above the raw fit
+// compresses under budget and the raw-fit size is returned (the phone then
+// sends it raw, which fits). Never smaller than the raw fit, so compression
+// never makes a picture smaller than it would be without it.
+//
+// (It used to keep the full width and shrink only the height, which squashed
+// any picture that didn't fit at its natural size.)
+func fitCompressed(src image.Image, opts Options, depth BitDepth, rawW, rawH int) (int, int, int) {
 	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
 	scale := 1.0
 	if sw > opts.MaxW {
@@ -1259,18 +1265,27 @@ func fitCompressed(src image.Image, opts Options, depth BitDepth) (int, int, int
 	}
 	palSize := 1 << int(depth)
 
-	// estimate compressed size at a given height (width fixed at fullW).
-	estAt := func(h int) int {
+	// height for a trial width, at the natural aspect ratio.
+	hFor := func(w int) int {
+		if w >= fullW {
+			return fullH
+		}
+		h := int(float64(fullH)*float64(w)/float64(fullW) + 0.5)
 		if h < 1 {
 			h = 1
 		}
-		dst := image.NewRGBA(image.Rect(0, 0, fullW, h))
+		return h
+	}
+
+	// estimate compressed size at a given size.
+	estAt := func(w, h int) int {
+		dst := image.NewRGBA(image.Rect(0, 0, w, h))
 		draw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
-		g8 := make([]byte, fullW*h)
+		g8 := make([]byte, w*h)
 		for y := 0; y < h; y++ {
-			for x := 0; x < fullW; x++ {
+			for x := 0; x < w; x++ {
 				r, g, bb, _ := dst.At(x, y).RGBA()
-				g8[y*fullW+x] = toGColor8(r, g, bb)
+				g8[y*w+x] = toGColor8(r, g, bb)
 			}
 		}
 		pal := buildPalette(g8, palSize)
@@ -1279,29 +1294,35 @@ func fitCompressed(src image.Image, opts Options, depth BitDepth) (int, int, int
 		// from the same continuous dst), or we'd size for the undithered (smaller)
 		// size and overflow once dithered. Keeps the guaranteed one-pass fit.
 		if cfgDither {
-			g8 = adaptiveDitherRGB(dst, fullW, h, pal,
+			g8 = adaptiveDitherRGB(dst, w, h, pal,
 				cfgDitherEdge, cfgDitherStrength, cfgDitherIntensity)
 		}
-		return estimateCompressed(g8, fullW, h, pal, depth)
+		return estimateCompressed(g8, w, h, pal, depth)
 	}
 
 	// If the full natural image already fits, take it — no shrink needed.
-	if e := estAt(fullH); e <= opts.MaxBytes {
+	if e := estAt(fullW, fullH); e <= opts.MaxBytes {
 		return fullW, fullH, e
 	}
-	// Otherwise binary-search the largest height that fits. lo always fits (>=1
-	// row is tiny), hi does not.
-	lo, hi := 1, fullH
-	bestH, bestE := 1, estAt(1)
+	// Otherwise binary-search the largest width above the raw fit that fits.
+	if rawW < 1 {
+		rawW = 1
+	}
+	if rawH < 1 {
+		rawH = 1
+	}
+	bestW, bestH, bestE := rawW, rawH, 0
+	lo, hi := rawW+1, fullW-1
 	for lo <= hi {
 		mid := (lo + hi) / 2
-		e := estAt(mid)
+		h := hFor(mid)
+		e := estAt(mid, h)
 		if e <= opts.MaxBytes {
-			bestH, bestE = mid, e
+			bestW, bestH, bestE = mid, h, e
 			lo = mid + 1
 		} else {
 			hi = mid - 1
 		}
 	}
-	return fullW, bestH, bestE
+	return bestW, bestH, bestE
 }

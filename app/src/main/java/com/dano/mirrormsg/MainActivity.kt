@@ -1,5 +1,7 @@
 package com.dano.mirrormsg
 
+import com.dano.mirrormsg.feedback.FeedbackFlavor
+import com.dano.mirrormsg.testbuild.TestBuilds
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +14,7 @@ import android.widget.Switch
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.LinearLayout
 import android.text.InputType
 import android.widget.EditText
@@ -83,6 +86,19 @@ class MainActivity : Activity() {
             "https://messages.google.com",
             "https://www.google.com"
         )
+
+        // A Gaia pairing request lives 300 s on Google's side (libgm sends it with
+        // that TTL). Google normally answers "timed out" itself; when no answer comes
+        // at all (the connection dropped while the phone slept), the confirm screen
+        // gives the emoji up this long after it appeared.
+        private const val PAIR_EXPIRE_MS = 330_000L
+
+        // The pairing screens.
+        private const val PAIR_NONE = 0
+        private const val PAIR_STARTING = 1   // asking Google for an emoji
+        private const val PAIR_CONFIRM = 2    // the emoji, to tap in Google Messages
+        private const val PAIR_EXPIRED = 3    // the emoji ran out before it was tapped
+        private const val PAIR_FAILED = 4     // Google said no, or the attempt broke
     }
 
     private val sink = object : EventSink {
@@ -91,7 +107,7 @@ class MainActivity : Activity() {
                 "PAIR_EMOJI" -> {
                     LogStore.w(TAG, ">>> Confirm THIS emoji on your phone: $jsonPayload")
                     val emoji = try { JSONObject(jsonPayload).optString("emoji") } catch (e: Exception) { "" }
-                    runOnUiThread { showPairingEmoji(emoji) }
+                    runOnUiThread { onPairingEmoji(emoji) }
                 }
                 "MESSAGE"      -> {
                     LogStore.i(TAG, "MESSAGE $jsonPayload")
@@ -230,14 +246,49 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
+        // Back (from Google Messages, or anywhere) to a pairing that ran out while the
+        // app was away: its emoji is no longer in Google Messages, so start a new
+        // pairing at once rather than leave the dead one up.
+        if (checkPairingExpiry() || pairRestartOnResume) {
+            pairRestartOnResume = false
+            LogStore.i(TAG, "Pairing ran out while the app was away; starting over.")
+            startPairingOver()
+        }
         // Re-render so the notification-permission checkmark reflects any change
         // made in system settings, and day/night theme stays current.
         if (homeShowing) renderHome()
     }
 
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
+    }
+
+    // A home tab tapped on the Feedback screen (test builds): that screen has
+    // closed, and onResume, which runs next, draws the tab. Back from it changes
+    // nothing.
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val pos = FeedbackFlavor.tabChosen(requestCode, resultCode, data)
+        if (pos in homeTabs.indices) activeTab = homeTabs[pos].second
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (homeShowing) renderHome()   // system day/night switch
+        // System day/night switch.
+        if (homeShowing) renderHome()
+        else if (pairKind != PAIR_NONE) showPairingScreen(pairKind, pairEmoji, pairDetail)
+    }
+
+    // Back during Google sign-in or pairing: the sign-in page steps back, and
+    // anything else cancels the pairing and returns to the home screen. Below
+    // Android 16 back arrives here; from 16 (target SDK 36) it arrives through
+    // the callback setPairingBack registers instead.
+    @Deprecated("Back below Android 16; see setPairingBack")
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (pairingBack) onPairingBack() else super.onBackPressed()
     }
 
     /**
@@ -247,6 +298,13 @@ class MainActivity : Activity() {
      * or the thread would open under whichever account the watch happened to show).
      */
     private fun handleNotificationLaunch(launchIntent: Intent?) {
+        // A call from the watch couldn't start for want of a permission: its notification
+        // opens this to ask for them.
+        if (launchIntent?.getBooleanExtra(Calls.EXTRA_SETUP, false) == true) {
+            launchIntent.removeExtra(Calls.EXTRA_SETUP)
+            if (Mirror.watchCalls) requestCallPermissions()
+            return
+        }
         if (launchIntent?.getBooleanExtra(Notifier.EXTRA_FROM_NOTIF, false) != true) return
         val convoId = launchIntent.getStringExtra(Notifier.EXTRA_CONVO_ID) ?: return
         val owner = launchIntent.getStringExtra(Notifier.EXTRA_SERVICE_ID)
@@ -316,13 +374,232 @@ class MainActivity : Activity() {
 
     private var activeTab = 0   // 0=Networks, 1=Settings, 2=Status; launch default chosen in onCreate by license state
 
-    // ---- Pairing emoji confirmation screen --------------------------------
-    // Shown while startGaiaPairing() blocks. The emoji to tap is in the Google
-    // Messages app on the phone (Device pairing prompt), NOT in this WebView.
-    private fun showPairingEmoji(emoji: String) {
-        homeShowing = false
+    // The home tabs in the order they're drawn: label and activeTab value. The
+    // Feedback screen (test builds) draws the same row from these labels.
+    private val homeTabs = listOf("Networks" to 0, "Status" to 2, "Settings" to 1)
+
+    // ---- Google pairing: attempts, the pairing screens, expiry ------------
+    // One Gaia pairing attempt at a time, each on its own bridge. An attempt that
+    // is cancelled, started over or runs out is stopped: its bridge is
+    // disconnected (which also withdraws the prompt in Google Messages when it
+    // still can), its events are dropped and its result never changes the
+    // screen. Every pairing screen has Start over and Cancel, and back cancels,
+    // so the confirm screen can't strand anyone on an emoji Google Messages no
+    // longer shows.
+    private class PairAttempt {
+        // WAITING -> PAIRED (the pairing thread) or WAITING -> STOPPED (the UI);
+        // whichever gets there first wins.
+        val state = java.util.concurrent.atomic.AtomicInteger(WAITING)
+        @Volatile var bridge: Bridge? = null
+        var emojiAt = 0L   // elapsedRealtime when its emoji appeared; 0 = not yet
+        @Volatile var multiDevice = false   // the account has several phones that could take it
+        val stopped get() = state.get() == STOPPED
+        companion object { const val WAITING = 0; const val PAIRED = 1; const val STOPPED = 2 }
+    }
+
+    private var pairing: PairAttempt? = null          // the live attempt, main thread only
+    private var pairKind = PAIR_NONE                  // the pairing screen showing
+    private var pairEmoji = ""
+    private var pairDetail = ""
+    private var pairRestartOnResume = false
+    private var activityResumed = false
+    private var pairingBack = false                   // back cancels (sign-in or pairing up)
+    private var backCallback: Any? = null             // android.window.OnBackInvokedCallback
+    private val pairHandler = Handler(Looper.getMainLooper())
+    private val pairExpiry = Runnable { checkPairingExpiry() }
+    // When the Google account has Google Messages on several phones, libgm asks
+    // the one seen most recently, which may not be the one in hand. Then the
+    // next attempt asks the next phone (the bridge's SetPairingTarget).
+    @Volatile private var pairMultiDevice = false     // set by the last attempt
+    private var pairTarget = 0
+
+    /** The bridge's events for one attempt: dropped once that attempt is stopped. */
+    private fun attemptSink(a: PairAttempt) = object : EventSink {
+        override fun onEvent(eventType: String, jsonPayload: String) {
+            if (a.stopped) return
+            when (eventType) {
+                "PAIR_STEP", "PAIR_LOG", "PAIR_FAILED" -> onPairingDiag(a, eventType, jsonPayload)
+                else -> sink.onEvent(eventType, jsonPayload)
+            }
+        }
+    }
+
+    /**
+     * The bridge's account of a pairing (bridge_pair.go): the config fetch,
+     * libgm's own steps (counts, timings and errors only) and why it stopped.
+     * Logged, so View logs shows where a pairing got to.
+     */
+    private fun onPairingDiag(a: PairAttempt, type: String, payload: String) {
+        if (type == "PAIR_FAILED") LogStore.w(TAG, "Pairing stopped: $payload")
+        else LogStore.i(TAG, "Pairing: $type $payload")
+        val several = try {
+            val j = JSONObject(payload)
+            j.optInt("devices", 0) > 1 || j.optBoolean("multiDevice", false)
+        } catch (_: Exception) { false }
+        if (several && !a.multiDevice) {
+            a.multiDevice = true
+            pairMultiDevice = true
+            LogStore.i(TAG, "Pairing: this Google account has more than one phone with Google Messages (asked phone $pairTarget).")
+        }
+    }
+
+    /** Stops the live attempt, if any (unless it has already paired). */
+    private fun stopPairAttempt() {
+        val a = pairing ?: return
+        pairing = null
+        pairHandler.removeCallbacks(pairExpiry)
+        if (!a.state.compareAndSet(PairAttempt.WAITING, PairAttempt.STOPPED)) return
+        val b = a.bridge ?: return   // not built yet: the pairing thread stops it itself
+        if (Mirror.bridge === b) Mirror.bridge = null
+        thread(name = "bridge-unpair") { try { b.disconnect() } catch (_: Exception) {} }
+    }
+
+    private fun onPairingEmoji(emoji: String) {
+        val a = pairing ?: return
+        if (a.stopped) return
+        a.emojiAt = SystemClock.elapsedRealtime()
+        showPairingScreen(PAIR_CONFIRM, emoji)
+        checkPairingExpiry()   // arms the expiry timer
+    }
+
+    /**
+     * Gives up the live attempt's emoji once PAIR_EXPIRE_MS have passed since it
+     * appeared with no answer from Google; otherwise (re)arms the timer for the time
+     * left. Measured on elapsedRealtime, so time asleep counts. True if it expired now.
+     */
+    private fun checkPairingExpiry(): Boolean {
+        val a = pairing ?: return false
+        if (a.emojiAt == 0L || a.stopped) return false
+        val left = PAIR_EXPIRE_MS - (SystemClock.elapsedRealtime() - a.emojiAt)
+        pairHandler.removeCallbacks(pairExpiry)
+        if (left > 0) {
+            pairHandler.postDelayed(pairExpiry, left)
+            return false
+        }
+        pairingExpired("no answer from Google ${PAIR_EXPIRE_MS / 1000} s after the emoji")
+        return true
+    }
+
+    private fun pairingExpired(why: String) {
+        LogStore.w(TAG, "Pairing expired ($why).")
+        stopPairAttempt()
+        paired = false
+        showPairingScreen(PAIR_EXPIRED)
+        // Not looking: start over when the app comes back. Looking: leave the
+        // expired screen up, so an app left open doesn't re-prompt forever.
+        if (!activityResumed) pairRestartOnResume = true
+    }
+
+    private fun pairingFailed(a: PairAttempt, msg: String) {
+        if (pairing !== a) return
+        // libgm: ErrPairingTimeout is "pairing timed out" (Google's own expiry).
+        if (msg.contains("pairing timed out")) { pairingExpired("Google: timed out"); return }
+        stopPairAttempt()
+        paired = false
+        val m = msg.lowercase()
+        // Tapped or turned down in Google Messages: the prompt reached the phone
+        // in hand, so the next attempt asks that same one.
+        if ("incorrect emoji" in m || "cancelled pairing on phone" in m) pairMultiDevice = false
+        val reason = when {
+            "incorrect emoji" in m -> "A different emoji was tapped in Google Messages."
+            "cancelled pairing on phone" in m -> "Pairing was cancelled in Google Messages."
+            "no devices found" in m ->
+                "Google didn't find Google Messages for this account. Check Google Messages on your phone uses this Google account."
+            "client init timed out" in m -> "Google Messages didn't answer. Check your phone is online."
+            "requires cookies" in m -> "The Google sign-in didn't finish."
+            else -> "Something went wrong while pairing."
+        }
+        showPairingScreen(PAIR_FAILED, detail = reason)
+    }
+
+    /** A new pairing: with the Google sign-in already in the cookies, else from the sign-in page. */
+    private fun startPairingOver() {
+        stopPairAttempt()
+        paired = false
+        val cookies = harvestCookies()
+        if (cookies.contains("__Secure-3PSID")) {
+            LogStore.i(TAG, "Starting pairing over with the Google sign-in already made.")
+            paired = true
+            pairWithCookies(cookies)
+        } else {
+            LogStore.i(TAG, "No Google sign-in to reuse; starting over from the sign-in page.")
+            startWebViewLogin()
+        }
+    }
+
+    private fun cancelPairing() {
+        LogStore.i(TAG, "Pairing cancelled.")
+        stopPairAttempt()
+        pairRestartOnResume = false
+        paired = false
+        val wv = webView
         webView = null
+        showHome(statusMsg)
+        reportConnectionStatus()
+        try { wv?.destroy() } catch (_: Exception) {}
+    }
+
+    private fun onPairingBack() {
+        val wv = webView
+        if (wv != null && wv.canGoBack()) wv.goBack() else cancelPairing()
+    }
+
+    /** Back cancels while the sign-in page or a pairing screen is up (see onBackPressed). */
+    private fun setPairingBack(on: Boolean) {
+        if (pairingBack == on) return
+        pairingBack = on
+        if (Build.VERSION.SDK_INT < 33) return
+        if (on) {
+            val cb = android.window.OnBackInvokedCallback { onPairingBack() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCallback = cb
+        } else {
+            (backCallback as? android.window.OnBackInvokedCallback)?.let {
+                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it)
+            }
+            backCallback = null
+        }
+    }
+
+    /** Home is back up: no pairing screen, back behaves normally again. */
+    private fun endPairingUi() {
+        pairKind = PAIR_NONE
+        setPairingBack(false)
+    }
+
+    // The emoji to tap is in the Google Messages app on the phone (Device pairing
+    // prompt), NOT in this app.
+    private fun showPairingScreen(kind: Int, emoji: String = "", detail: String = "") {
+        homeShowing = false
+        pairKind = kind; pairEmoji = emoji; pairDetail = detail
+        setPairingBack(true)
         val p = palette()
+        val title: String
+        val icon: String
+        val body: String
+        when (kind) {
+            PAIR_CONFIRM -> {
+                title = "Confirm pairing"
+                icon = if (emoji.isNotEmpty()) emoji else "\uD83D\uDD17"
+                body = "Open Google Messages on your phone, find the device-pairing prompt, and tap this emoji."
+            }
+            PAIR_EXPIRED -> {
+                title = "Pairing expired"
+                icon = "\u231B"
+                body = "This pairing ran out before it was confirmed, so its emoji is no longer in Google Messages. Start over to get a new one."
+            }
+            PAIR_FAILED -> {
+                title = "Pairing didn't finish"
+                icon = "\u26A0\uFE0F"
+                body = "$detail Start over to try again."
+            }
+            else -> {
+                title = "Starting pairing\u2026"
+                icon = "\uD83D\uDD17"
+                body = "Asking Google Messages for a pairing emoji."
+            }
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -330,20 +607,48 @@ class MainActivity : Activity() {
             setPadding(dp(32), dp(48), dp(32), dp(48))
         }
         root.addView(TextView(this).apply {
-            text = "Confirm pairing"; textSize = 22f; setTextColor(p.text)
+            text = title; textSize = 22f; setTextColor(p.text)
             gravity = Gravity.CENTER
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = if (emoji.isNotEmpty()) emoji else "\uD83D\uDD17"
+            text = icon
             textSize = 72f; gravity = Gravity.CENTER
             setPadding(0, dp(24), 0, dp(24))
         })
         root.addView(TextView(this).apply {
-            text = "Open Google Messages on your phone, find the device-pairing prompt, and tap this emoji."
+            text = body
             textSize = 16f; setTextColor(p.subtext); gravity = Gravity.CENTER
         })
-        setContentView(root)
+        if (pairMultiDevice && kind != PAIR_STARTING) root.addView(TextView(this).apply {
+            text = "This Google account has Google Messages on more than one phone, so the " +
+                "prompt may be on another one. Start over asks the next phone."
+            textSize = 14f; setTextColor(p.subtext); gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, 0)
+        })
+        root.addView(accentButton(p, "Start over") {
+            LogStore.i(TAG, "Pairing: Start over tapped.")
+            startPairingOver()
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(32) })
+        root.addView(Button(this).apply {
+            text = "Cancel"; setTextColor(p.text); textSize = 16f
+            isAllCaps = false
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = rounded(Color.TRANSPARENT, 12, 1, p.cardBorder)
+            stateListAnimator = null
+            setOnClickListener { cancelPairing() }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+        // Scrolls when the screen is too short (a folded phone in landscape), so the
+        // buttons are always reachable.
+        setContentView(ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(p.bg)
+            addView(root, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        })
     }
 
     // ---- Home screen (two-tab: Settings | Accounts) -----------------------
@@ -359,6 +664,7 @@ class MainActivity : Activity() {
 
     private fun renderHome() {
         homeShowing = true
+        endPairingUi()
         // Preserve scroll across a same-tab rebuild — toggling an account re-renders
         // the whole tab, and without this the user is yanked back to the top. A tab
         // *switch* deliberately starts fresh at the top.
@@ -393,26 +699,38 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(16), dp(16), dp(8))
         }
+        // Test builds add a 4th tab, Feedback, which opens its own screen
+        // (FeedbackFlavor; release builds don't have it). Four tabs get a
+        // smaller font and padding so they fit a narrow screen on one line.
+        val withFeedback = FeedbackFlavor.available
         fun tab(label: String, index: Int): TextView = TextView(this).apply {
-            text = label; textSize = 15f; gravity = Gravity.CENTER
-            setPadding(dp(12), dp(14), dp(12), dp(14))
+            text = label; textSize = if (withFeedback) 14f else 15f; gravity = Gravity.CENTER
+            val side = if (withFeedback) 4 else 12
+            setPadding(dp(side), dp(14), dp(side), dp(14))
+            if (withFeedback) isSingleLine = true
             val selected = activeTab == index
             setTextColor(if (selected) p.onAccent else p.text)
             background = rounded(if (selected) p.accent else p.card, 10,
                 if (selected) 0 else 1, p.cardBorder)
             setOnClickListener { activeTab = index; renderHome() }
         }
-        val settingsTab = tab("Settings", 1)
-        val accountsTab = tab("Networks", 0)
-        val statusTab = tab("Status", 2)
-        tabRow.addView(accountsTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(10), 1))
-        tabRow.addView(statusTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(10), 1))
-        tabRow.addView(settingsTab, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val gap = if (withFeedback) 6 else 10
+        homeTabs.forEachIndexed { i, (label, index) ->
+            if (i > 0) tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
+            tabRow.addView(tab(label, index), LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        if (withFeedback) {
+            // The Feedback screen draws this header and these tabs too, with
+            // Feedback selected; a tab tapped there comes back through
+            // onActivityResult.
+            val feedbackTab = tab("Feedback", -1).apply {
+                setOnClickListener { FeedbackFlavor.open(this@MainActivity, homeTabs.map { it.first }) }
+            }
+            tabRow.addView(android.view.View(this), LinearLayout.LayoutParams(dp(gap), 1))
+            tabRow.addView(feedbackTab, LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
         root.addView(tabRow)
 
         // Tab content in a scroll view.
@@ -494,10 +812,26 @@ class MainActivity : Activity() {
             pushConversationsToWatch()
         }
         addDivider(setCard, p)
-        addToggleRow(setCard, p, "Emoji substitution",
-            "Show unsupported emoji as a close supported one", Mirror.emojiSubstitution) { on ->
-            Mirror.setEmojiSubstitution(this, on)
-            pushConversationsToWatch()
+        // Only for the Time / Time Steel (or before the watch has said which it is):
+        // the Time 2 and Round 2 draw every emoji. Redrawn when the watch's width
+        // first arrives or changes.
+        if (Mirror.emojiSubForWatch()) {
+            addToggleRow(setCard, p, "Emoji substitution",
+                "Show unsupported emoji as a close supported one", Mirror.emojiSubstitution) { on ->
+                Mirror.setEmojiSubstitution(this, on)
+                pushConversationsToWatch()
+            }
+            addDivider(setCard, p)
+        }
+        Mirror.onWatchWidthChanged = {
+            runOnUiThread { if (homeShowing && activeTab == 1 && activityResumed) renderHome() }
+        }
+        // Calls from the watch (Calls.kt): a Call row in the watch's reply menu. Turning
+        // it on asks for the phone-call and contacts permissions.
+        addToggleRow(setCard, p, "Calls from the watch",
+            "Call a chat from the watch's reply menu. The call starts on this phone", Mirror.watchCalls) { on ->
+            Mirror.setWatchCalls(this, on)
+            if (on) requestCallPermissions()
         }
         if (Media.engine.playsVideo) {
             addDivider(setCard, p)
@@ -537,106 +871,76 @@ class MainActivity : Activity() {
         c.addView(setCard)
 
         // ---- IMAGE QUALITY ------------------------------------------------
+        // One setting (Mirror.imgQuality): the stop sets every encoder dial.
         sectionLabel(c, p, "Image quality")
         val iqCard = card(p)
-        // Animate adds/removes inside this card so the compressibility dial slides
-        // in and the rows below it push down smoothly, instead of snapping.
-        iqCard.layoutTransition = android.animation.LayoutTransition().apply {
-            enableTransitionType(android.animation.LayoutTransition.CHANGING)
+        addStopSliderRow(iqCard, p, "Pictures", Mirror.IMG_QUALITY_NAMES, listOf(
+                "Plain colors: pictures arrive quicker, skies show bands",
+                "Smooth gradients",
+                "Smooth gradients, and previews keep every color"),
+            Mirror.imgQuality, "faster  \u2190          \u2192  sharper") { q ->
+            Mirror.setImgQuality(this, q)
         }
-        iqCard.addView(TextView(this).apply {
-            text = "Images use as many colors as they need, up to a limit. " +
-                "The sliders decide how readily a busy image settles for fewer " +
-                "colors — lower = fewer colors more often (smaller, faster), " +
-                "higher = keep more colors."
-            textSize = 13f; setTextColor(p.subtext)
-            setPadding(0, dp(2), 0, dp(10))
-        })
-        addColorCapRow(iqCard, p, "Thumbnail color limit",
-            "Max colors for chat-view previews.", Mirror.imgThumbCap) { colors ->
-            Mirror.setImgThumbCap(this, colors)
-        }
-        addDivider(iqCard, p)
-        addCoverageSliderRow(iqCard, p, "Thumbnail colors",
-            Mirror.imgThumbCoverage) { pct -> Mirror.setImgThumbCoverage(this, pct) }
-        addDivider(iqCard, p)
-        addColorCapRow(iqCard, p, "Full-size color limit",
-            "Max colors for the opened image.", Mirror.imgFullCap) { colors ->
-            Mirror.setImgFullCap(this, colors)
-        }
-        addDivider(iqCard, p)
-        addCoverageSliderRow(iqCard, p, "Full-size colors",
-            Mirror.imgFullCoverage) { pct -> Mirror.setImgFullCoverage(this, pct) }
-        addDivider(iqCard, p)
-        addToggleRow(iqCard, p, "Compress large images",
-            "Keep full-size images compressed in watch memory so bigger images fit.",
-            Mirror.imgCompress) { on ->
-            Mirror.setImgCompress(this, on)
-            // Show/hide the compressibility dial IN PLACE — same approach as the
-            // Beeper master switch. Re-rendering the tab instead made the whole
-            // settings list flicker and jump the scroll position.
-            compressDitherRow?.visibility =
-                if (on) android.view.View.VISIBLE else android.view.View.GONE
-        }
-        addDivider(iqCard, p)
-        addDitherSection(iqCard, p)
         c.addView(iqCard)
-    }
 
-    // Dithering: a switch that reveals three sliders (edge protection, strength,
-    // intensity). Simulates more colours on smooth gradients by blending palette
-    // colours, at a compression cost — so it's opt-in. The sliders are disabled
-    // (greyed) until the switch is on.
-    // The compressibility dial, held so the compression switch can show/hide it in
-    // place. Rebuilt on each render of the settings tab; cleared implicitly when
-    // that tab is rebuilt, and only ever touched from the compression switch's
-    // listener while the same tab is on screen.
-    private var compressDitherRow: android.view.View? = null
-
-    private fun addDitherSection(parent: LinearLayout, p: Palette) {
-        val sliders = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        fun setEnabled(on: Boolean) {
-            sliders.alpha = if (on) 1f else 0.4f
-            fun walk(v: android.view.View) {
-                v.isEnabled = on
-                if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+        // ---- TEST BUILDS --------------------------------------------------
+        // Test (debug) builds only (TestBuilds; release builds have no updater):
+        // install newer test builds by themselves. The detail line follows the
+        // updater: installed, newest, and what it's doing.
+        if (TestBuilds.available) {
+            sectionLabel(c, p, "Test builds")
+            val tbCard = card(p)
+            val detail = addToggleRow(tbCard, p, "Install new test builds automatically",
+                TestBuilds.detail(), TestBuilds.autoInstall) { on ->
+                TestBuilds.setAutoInstall(this, on)
             }
-            walk(sliders)
+            TestBuilds.bindDetail(detail)
+            // The owner code (FeedbackFlavor): the Feedback screen asks for it only
+            // while none is set, so changing or clearing a saved one is here.
+            if (FeedbackFlavor.available) {
+                addDivider(tbCard, p)
+                addOwnerCodeRow(tbCard, p)
+            }
+            c.addView(tbCard)
         }
-        addToggleRow(parent, p, "Dither gradients",
-            "Blend palette colors to smooth gradients and simulate more colors. " +
-            "Flat areas and hard edges stay crisp.",
-            Mirror.imgDither) { on -> Mirror.setImgDither(this, on); setEnabled(on) }
-        // Only meaningful alongside compression: this dial trades dithering away to
-        // keep long runs of identical pixels intact for the compressor. With
-        // compression off there is nothing to preserve, so the encoder dithers the
-        // whole image and the dial is hidden rather than shown doing nothing.
-        // It's built ALWAYS and kept in the layout with its visibility toggled, so
-        // the compression switch reveals it in place (no re-render, no flicker,
-        // no scroll jump) — the same technique the Beeper master switch uses.
-        val compressRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        addSliderRow(compressRow, p, "Keep images compressible",
-            "Leaves flat areas and hard edges undithered so images compress smaller. " +
-            "Lower means smoother gradients but larger transfers.",
-            Mirror.imgDitherCompress,
-            "smoother  \u2190          \u2192  smaller") { v -> Mirror.setImgDitherCompress(this, v) }
-        compressRow.visibility =
-            if (Mirror.imgCompress) android.view.View.VISIBLE else android.view.View.GONE
-        compressDitherRow = compressRow
-        sliders.addView(compressRow)
-        addSliderRow(sliders, p, "Dither strength",
-            "Higher = stronger texture; lower = softer and more compressible.",
-            Mirror.imgDitherIntensity,
-            "lite  \u2190          \u2192  strong") { v -> Mirror.setImgDitherIntensity(this, v) }
-        parent.addView(sliders)
-        setEnabled(Mirror.imgDither)
     }
 
-    // Generic 0-100 slider row with a caption. Value label updates live; onChange
-    // fires on release.
-    private fun addSliderRow(parent: LinearLayout, p: Palette, title: String,
-                             sub: String, current: Int, caption: String,
-                             onChange: (Int) -> Unit) {
+    // Settings > Test builds: the owner code, set or not; a tap pastes a new one
+    // or clears it (FeedbackFlavor.editOwnerCode). Debug builds only.
+    private fun addOwnerCodeRow(parent: LinearLayout, p: Palette) {
+        fun state() = if (FeedbackFlavor.hasOwnerCode(this)) "Set. Tap to change or clear it"
+            else "Not set. Tap to paste your access code"
+        val sub = TextView(this).apply {
+            text = state(); textSize = 13f; setTextColor(p.subtext)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener {
+                FeedbackFlavor.editOwnerCode(this@MainActivity) { sub.text = state() }
+            }
+        }
+        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        txt.addView(TextView(this).apply {
+            text = "Owner code"; textSize = 16f; setTextColor(p.text)
+        })
+        txt.addView(sub)
+        row.addView(txt, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(TextView(this).apply {
+            text = "\u203A"; textSize = 22f; setTextColor(p.subtext)
+        })
+        parent.addView(row)
+    }
+
+    // A slider with a few named stops: the title, a line saying what the current
+    // stop does, the stop's name on the right, and a caption under the bar. The
+    // line and the name follow the thumb live; onChange fires on release.
+    private fun addStopSliderRow(parent: LinearLayout, p: Palette, title: String,
+                                 names: List<String>, lines: List<String>, current: Int,
+                                 caption: String, onChange: (Int) -> Unit) {
+        val last = names.size - 1
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, dp(8))
@@ -649,26 +953,32 @@ class MainActivity : Activity() {
         titles.addView(TextView(this).apply {
             text = title; textSize = 16f; setTextColor(p.text)
         })
-        titles.addView(TextView(this).apply {
-            text = sub; textSize = 13f; setTextColor(p.subtext)
-        })
+        val start = current.coerceIn(0, last)
+        val line = TextView(this).apply {
+            text = lines[start]; textSize = 13f; setTextColor(p.subtext)
+        }
+        titles.addView(line)
         header.addView(titles, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val valueLabel = TextView(this).apply {
-            text = "$current"; textSize = 14f; setTextColor(p.subtext)
+            text = names[start]; textSize = 14f; setTextColor(p.subtext)
         }
         header.addView(valueLabel)
         col.addView(header)
+        var shown = start
         val seek = android.widget.SeekBar(this).apply {
-            max = 100
-            progress = current.coerceIn(0, 100)
+            max = last
+            progress = start
             setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
-                    valueLabel.text = "$prog"
+                    val k = prog.coerceIn(0, last)
+                    valueLabel.text = names[k]
+                    line.text = lines[k]
                 }
                 override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
                 override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
-                    onChange(sb?.progress ?: 0)
+                    val k = (sb?.progress ?: shown).coerceIn(0, last)
+                    if (k != shown) { shown = k; onChange(k) }
                 }
             })
         }
@@ -854,6 +1164,7 @@ class MainActivity : Activity() {
             }
             revealAccounts(accWrap, accCard, on)   // slide out / back under
             pushConversationsToWatch()             // refresh the watch switcher
+            PebbleListenerService.instance?.refreshSwitcher()   // accounts changed
         }
         masterCard.addView(masterTxt, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -924,6 +1235,7 @@ class MainActivity : Activity() {
                 }
                 renderHome()
                 pushConversationsToWatch()
+                PebbleListenerService.instance?.refreshSwitcher()   // accounts changed
                 true
             }
         }
@@ -1433,8 +1745,9 @@ class MainActivity : Activity() {
             mix(Color.blue(over), Color.blue(under)))
     }
 
+    /** Returns the row's subtitle, for a row whose detail changes while it's shown. */
     private fun addToggleRow(parent: LinearLayout, p: Palette, title: String,
-                             sub: String, initial: Boolean, onChange: (Boolean) -> Unit) {
+                             sub: String, initial: Boolean, onChange: (Boolean) -> Unit): TextView {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1444,9 +1757,10 @@ class MainActivity : Activity() {
         txt.addView(TextView(this).apply {
             text = title; textSize = 16f; setTextColor(p.text)
         })
-        txt.addView(TextView(this).apply {
+        val subView = TextView(this).apply {
             text = sub; textSize = 13f; setTextColor(p.subtext)
-        })
+        }
+        txt.addView(subView)
         val sw = Switch(this).apply {
             isChecked = initial
             setOnCheckedChangeListener { _, c -> onChange(c) }
@@ -1455,48 +1769,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(sw)
         parent.addView(row)
-    }
-
-    // ---- Image quality helper rows ----------------------------------------
-    // Colour-cap picker: a small spinner of 2 / 4 / 16 (the three watch-supported
-    // palette sizes). onPick gets the chosen colour COUNT.
-    private fun addColorCapRow(parent: LinearLayout, p: Palette, title: String,
-                               subtitle: String, current: Int, onPick: (Int) -> Unit) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        txt.addView(TextView(this).apply {
-            text = title; textSize = 16f; setTextColor(p.text)
-        })
-        txt.addView(TextView(this).apply {
-            text = subtitle; textSize = 13f; setTextColor(p.subtext)
-        })
-        val options = listOf(2, 4, 16)
-        val spinner = android.widget.Spinner(this).apply {
-            adapter = android.widget.ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                options.map { "$it colors" }).apply {
-                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-            }
-            setSelection(options.indexOf(current).coerceAtLeast(0))
-            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
-                                            view: android.view.View?, pos: Int, id: Long) {
-                    val picked = options[pos]
-                    if (picked != current) onPick(picked)
-                }
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-            }
-        }
-        row.addView(txt, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(spinner, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        parent.addView(row)
+        return subView
     }
 
     // A setting with a few named choices: title and subtitle, and a dropdown on the right.
@@ -1540,50 +1813,6 @@ class MainActivity : Activity() {
             val c = v.coerceIn(0, labels.size - 1)
             if (c != shown) { shown = c; spinner.setSelection(c) }
         }
-    }
-
-    // Coverage slider: a SeekBar mapped to 10-100% with a live "fewer <-> more
-    // colours" caption and the current percent. onChange fires on release.
-    private fun addCoverageSliderRow(parent: LinearLayout, p: Palette, title: String,
-                                     currentPct: Int, onChange: (Int) -> Unit) {
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        header.addView(TextView(this).apply {
-            text = title; textSize = 16f; setTextColor(p.text)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val valueLabel = TextView(this).apply {
-            text = "$currentPct%"; textSize = 14f; setTextColor(p.subtext)
-        }
-        header.addView(valueLabel, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        col.addView(header)
-        val seek = android.widget.SeekBar(this).apply {
-            max = 90                       // 0..90 maps to 10..100%
-            progress = (currentPct - 10).coerceIn(0, 90)
-            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
-                    valueLabel.text = "${prog + 10}%"
-                }
-                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
-                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
-                    onChange((sb?.progress ?: 0) + 10)
-                }
-            })
-        }
-        col.addView(seek, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        val caption = TextView(this).apply {
-            text = "fewer colors  \u2190          \u2192  more colors"
-            textSize = 11f; setTextColor(p.subtext)
-        }
-        col.addView(caption)
-        parent.addView(col)
     }
 
     /**
@@ -2142,6 +2371,19 @@ class MainActivity : Activity() {
         svc.startLogin(this)
     }
 
+    /** Both permissions Calls from the watch asks for are granted. */
+    private fun hasCallPermissions(): Boolean = Calls.PERMISSIONS.all {
+        checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    /** Ask for whichever of Calls from the watch's permissions are missing. */
+    private fun requestCallPermissions() {
+        val missing = Calls.PERMISSIONS.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 9010)
+    }
+
     /** True when the Beeper app is installed (visible via the manifest <queries>). */
     private fun isBeeperInstalled(): Boolean =
         try { packageManager.getPackageInfo("com.beeper.android", 0); true }
@@ -2197,6 +2439,33 @@ class MainActivity : Activity() {
             isBatteryUnrestricted(),
             "Keeps MirrorMsg running so messages arrive reliably") {
             requestBatteryUnrestricted()
+        }
+        // Calls from the watch, while it's on: the permissions it asks for, "Display over
+        // other apps" (a WhatsApp, Signal or Telegram call starts in one press; without it
+        // the watch shows a Call button to press), and notification access (Hang up from
+        // the watch; shown below with Beeper's when Beeper is installed).
+        if (Mirror.watchCalls) {
+            addDivider(permCard, p)
+            addCheckRow(permCard, p, "Phone calls and contacts", hasCallPermissions(),
+                "Lets the watch start calls on this phone") {
+                requestCallPermissions()
+            }
+            addDivider(permCard, p)
+            addCheckRow(permCard, p, "Display over other apps", Settings.canDrawOverlays(this),
+                "Starts WhatsApp, Signal and Telegram calls from the watch in one press") {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:$packageName")))
+                } catch (e: Exception) { LogStore.e(TAG, "Overlay settings didn't open", e) }
+            }
+            if (!isBeeperInstalled()) {
+                addDivider(permCard, p)
+                addCheckRow(permCard, p, "Notification access",
+                    hasNotificationListenerAccess(),
+                    "Lets you hang up from the watch") {
+                    openNotificationListenerSettings()
+                }
+            }
         }
         // Beeper-specific permissions grouped together at the BOTTOM, and shown ONLY
         // when the Beeper app is installed. Both are only meaningful with Beeper:
@@ -2420,6 +2689,11 @@ class MainActivity : Activity() {
         // 1. Let the service clear its own session/state (Google clears its
         //    session + cached number; Facebook clears its fb_session, etc.).
         service.logout(this)
+        // Its cached conversation lists go too, and an open watchapp is told now:
+        // it gets the next logged-in account's list, or the empty roster (the
+        // watch then drops its saved list and asks to log in on the phone).
+        Mirror.dropCachedConvoLists(this, service.id)
+        PebbleListenerService.instance?.refreshSwitcher()
         // 2. Wipe WebView cookies so the next login starts fresh. (Both Google
         //    and Facebook log in via harvested WebView cookies, so this is
         //    shared cleanup — harmless for services that don't use it.)
@@ -2680,7 +2954,8 @@ class MainActivity : Activity() {
                 Schema.KEY_OP             to PebbleDictionaryItem.Int32(Schema.OP_CONVO),
                 Schema.KEY_SERVICES       to PebbleDictionaryItem.Text(labels),
                 Schema.KEY_ACTIVE_SERVICE to PebbleDictionaryItem.Int32(activeIdx),
-                Schema.KEY_SERVICE_FLAGS  to PebbleDictionaryItem.Int32(serviceFlags)
+                Schema.KEY_SERVICE_FLAGS  to PebbleDictionaryItem.Int32(serviceFlags),
+                Schema.KEY_NEWCHAT_MASK   to PebbleDictionaryItem.Int32(Mirror.newChatMask(this, entries))
             )
             sender.sendDataToPebble(Schema.WATCH_UUID, frame, watches = null)
             LogStore.i(TAG, "Pushed service list to watch: [$labels] active=$activeIdx flags=$serviceFlags")
@@ -2795,6 +3070,10 @@ class MainActivity : Activity() {
 
     internal fun startWebViewLogin() {
         homeShowing = false
+        stopPairAttempt()
+        paired = false          // a new sign-in always pairs once its page loads
+        pairKind = PAIR_NONE
+        setPairingBack(true)    // back steps back through the page, then cancels
         thread(name = "bridge-init") {
             try { Mirror.bridge = Mirrorbridge.newBridge("", sink) }
             catch (e: Exception) { LogStore.e(TAG, "Bridge init failed", e) }
@@ -2834,19 +3113,45 @@ class MainActivity : Activity() {
 
         wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
-                if (url != null && url.contains("messages.google.com/web") && !paired) {
-                    val cookies = harvestCookies()
-                    if (!cookies.contains("__Secure-3PSID")) {
-                        LogStore.w(TAG, "At messages page but __Secure-3PSID not set yet; waiting.")
-                        return
-                    }
-                    paired = true
-                    LogStore.i(TAG, "Login complete; harvested cookies. Pairing…")
-                    pairWithCookies(cookies)
+                if (url == null || webView !== wv) return
+                // Host and path only: the query can name the account.
+                val page = try { android.net.Uri.parse(url).let { "${it.host}${it.path}" } } catch (_: Exception) { "?" }
+                LogStore.i(TAG, "Pairing: sign-in page loaded: $page")
+                if (url.contains("messages.google.com/web") && !paired && harvesting !== wv) {
+                    harvesting = wv
+                    tryHarvest(wv, 0)
                 }
             }
         }
         wv.loadUrl(LOGIN_URL)
+    }
+
+    private var harvesting: WebView? = null   // the sign-in page being checked for its cookie
+
+    /**
+     * Pairs with the sign-in cookies once __Secure-3PSID is there. Google can set
+     * it a moment after the page has loaded, with no further page load to wait
+     * for, so look again every second for 15 s rather than leave the sign-in page
+     * up with nothing happening.
+     */
+    private fun tryHarvest(wv: WebView, tries: Int) {
+        if (paired || webView !== wv) return
+        val cookies = harvestCookies()
+        if (!cookies.contains("__Secure-3PSID")) {
+            if (tries == 0) LogStore.w(TAG, "At messages page but __Secure-3PSID not set yet; waiting.")
+            if (tries < 15) {
+                pairHandler.postDelayed({ tryHarvest(wv, tries + 1) }, 1000L)
+            } else {
+                LogStore.w(TAG, "Pairing: the sign-in cookie never arrived; pairing not started.")
+                webView = null
+                showPairingScreen(PAIR_FAILED, detail = "The Google sign-in didn't finish.")
+                try { wv.destroy() } catch (_: Exception) {}   // off screen now
+            }
+            return
+        }
+        paired = true
+        LogStore.i(TAG, "Login complete; harvested cookies. Pairing…")
+        pairWithCookies(cookies)
     }
 
     private fun harvestCookies(): String {
@@ -2865,30 +3170,66 @@ class MainActivity : Activity() {
     }
 
     private fun pairWithCookies(cookiesJson: String) {
+        stopPairAttempt()
+        // The last attempt went to one of several phones and was never answered
+        // there: ask the next one this time.
+        if (pairMultiDevice) {
+            pairTarget++
+            LogStore.i(TAG, "Pairing: asking the next phone on this Google account (phone $pairTarget).")
+        }
+        pairMultiDevice = false
+        val target = pairTarget
+        val a = PairAttempt()
+        pairing = a
+        showPairingScreen(PAIR_STARTING)
+        // The sign-in page is done with once its cookies are harvested. This can run
+        // inside its onPageFinished, so destroy it after that callback returns.
+        webView?.let { wv ->
+            webView = null
+            Handler(Looper.getMainLooper()).post { try { wv.destroy() } catch (_: Exception) {} }
+        }
         thread(name = "bridge-pair") {
             try {
-                val b = Mirror.bridge ?: Mirrorbridge.newBridge("", sink).also { Mirror.bridge = it }
+                // A fresh bridge per attempt: a stopped one's context is cancelled for good.
+                val b = Mirrorbridge.newBridge("", attemptSink(a))
+                a.bridge = b
+                if (a.stopped) { try { b.disconnect() } catch (_: Exception) {}; return@thread }
+                Mirror.bridge = b
                 b.setCookies(cookiesJson)
-                LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone…")
+                b.setPairingTarget(target.toLong())
+                LogStore.i(TAG, "Gaia pairing — confirm the emoji on your phone… (phone $target)")
                 b.startGaiaPairing()
+                if (!a.state.compareAndSet(PairAttempt.WAITING, PairAttempt.PAIRED)) {
+                    LogStore.w(TAG, "Pairing went through after it was stopped; dropping it.")
+                    try { b.disconnect() } catch (_: Exception) {}
+                    return@thread
+                }
+                pairMultiDevice = false   // this phone answered: keep asking it
                 val s = b.exportSession()
                 Vault.putString(prefs, PREF_SESSION, s)   // sealed in the Keystore
                 LogStore.i(TAG, "Paired and session saved (${s.length} chars).")
                 b.connect()
                 LogStore.i(TAG, "Connected.")
                 runOnUiThread {
+                    if (pairing === a) { pairing = null; pairHandler.removeCallbacks(pairExpiry) }
                     webView = null
                     showHome("Connected. Mirroring live.")
                 }
             } catch (e: Exception) {
+                if (a.stopped) {
+                    LogStore.i(TAG, "Stopped pairing attempt ended (${e.message}).")
+                    return@thread
+                }
                 LogStore.e(TAG, "Pairing failed", e)
-                paired = false
+                runOnUiThread { pairingFailed(a, e.message ?: "") }
             }
         }
     }
 
     override fun onDestroy() {
         Mirror.onSoundChanged = null   // the Settings picker goes with this screen
+        Mirror.onWatchWidthChanged = null
+        pairHandler.removeCallbacksAndMessages(null)
         webView?.destroy()
         // Leave Mirror.bridge alive — PebbleListenerService may still need it.
         super.onDestroy()

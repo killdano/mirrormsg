@@ -25,3 +25,17 @@ dependencyResolutionManagement {
 
 rootProject.name = "MirrorMsg"
 include(":app")
+
+// The Feedback screen, in test (debug) builds only: app/build.gradle.kts
+// takes :feedback as debugImplementation, so release builds have none of it.
+// :feedback wraps the shared Feedback tab from mirrorapps-kit, a git
+// submodule at kit/ (the module is kit/kit/).
+include(":feedback")
+include(":kit")
+project(":kit").projectDir = file("kit/kit")
+
+// The test-build updater from mirrorapps-kit (kit/updater/): test (debug)
+// builds install newer test builds by themselves. app/build.gradle.kts takes
+// it as debugImplementation, so release builds have none of it.
+include(":kit-updater")
+project(":kit-updater").projectDir = file("kit/updater")

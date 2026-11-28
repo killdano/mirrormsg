@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug (test) builds only: they install newer test builds by themselves
+  (testbuild/TestBuilds.kt, with mirrorapps-kit's updater/ module). Release
+  builds don't merge this file, so their permission list, and the store's,
+  stay as they are.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Install a downloaded test build through PackageInstaller. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Ask Android to update MirrorMsg without a tap once MirrorMsg installed the previous build. -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
+    <!-- Starts the updater whenever the app's process starts. Release builds have no Application class. -->
+    <application android:name="com.dano.mirrormsg.testbuild.TestBuildApp" />
+
+</manifest>

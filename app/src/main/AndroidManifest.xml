@@ -33,6 +33,15 @@
          (or Settings -> Apps -> MirrorMsg -> Display over other apps). -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- Calls from the watch (Calls.kt), off until switched on in Settings, which asks
+         for both: an ordinary phone call for a text chat (CALL_PHONE), and the contacts
+         entry WhatsApp, Signal or Telegram keeps for a person's voice call
+         (READ_CONTACTS, read on the phone only). CALL_PHONE would otherwise imply a
+         required telephony feature and hide the app from devices without one. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
     <!-- Beeper Content Provider (authority com.beeper.api): read chats/messages
          and send, via the Beeper Android app. Custom Beeper permissions, granted
          at runtime like POST_NOTIFICATIONS. -->
@@ -64,6 +73,10 @@
              as a belt-and-suspenders alongside the package entry. -->
         <package android:name="com.beeper.android" />
         <provider android:authorities="com.beeper.api" />
+        <!-- MirrorMap Dash: the only caller of the Dash Cam picker and send service,
+             and the message card service MirrorMsg binds (MapCard); its signing
+             certificate is checked (CamCallers). -->
+        <package android:name="com.mirrormap.dash" />
     </queries>
 
     <application
@@ -165,6 +178,19 @@
             android:name=".ReplyReceiver"
             android:exported="false" />
 
+        <!-- Calls from the watch: the calling notification's Hang up, and the invisible
+             trampoline that starts a network's call from that notification's Call. -->
+        <receiver
+            android:name=".CallReceiver"
+            android:exported="false" />
+        <activity
+            android:name=".CallActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
         <activity
             android:name=".QuickRepliesActivity"
             android:exported="false" />
@@ -223,6 +249,30 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:label="Instagram Login" />
+
+        <!-- Dash Cam, for MirrorMap Dash: the chat picker (started for a result) and
+             the bound send service. Exported for Dash; both refuse any caller that
+             isn't Dash with a pinned signing certificate (CamCallers). -->
+        <activity
+            android:name=".CamPickActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:label="Dash Cam">
+            <intent-filter>
+                <action android:name="com.dano.mirrormsg.action.CAM_PICK_CHAT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".CamSendService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="com.dano.mirrormsg.action.CAM_SEND" />
+            </intent-filter>
+        </service>
 
     </application>
 </manifest>

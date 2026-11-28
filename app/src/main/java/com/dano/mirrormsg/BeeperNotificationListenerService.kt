@@ -14,7 +14,9 @@ import kotlin.concurrent.thread
  * Access (the row in Settings → Permissions → "Notification access", which
  * deep-links to the system grant screen). Until granted, [onListenerConnected]
  * never fires and no callbacks arrive. We filter strictly to the Beeper package
- * and ignore everything else — we never inspect other apps' notifications.
+ * and ignore everything else, with one exception: Calls from the watch (Calls.kt)
+ * looks for the ongoing call notification of a call it started, only to press its
+ * hang-up (Hang up from the watch) and to know when that call ended.
  *
  * Threading: callbacks arrive on the system binder thread; image decode + file
  * I/O is pushed onto a worker thread so we never block the binder.
@@ -32,16 +34,34 @@ class BeeperNotificationListenerService : NotificationListenerService() {
         @Volatile
         var connected: Boolean = false
             private set
+
+        // The bound listener (null when not connected): Calls reads the active
+        // notifications through it.
+        @Volatile
+        var instance: BeeperNotificationListenerService? = null
+            private set
     }
 
     override fun onListenerConnected() {
         connected = true
+        instance = this
         LogStore.i(TAG, "Beeper-Notif: listener connected")
     }
 
     override fun onListenerDisconnected() {
         connected = false
+        instance = null
         LogStore.i(TAG, "Beeper-Notif: listener disconnected")
+    }
+
+    override fun onDestroy() {
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        val n = sbn ?: return
+        Calls.onNotificationRemoved(Mirror.appContext ?: applicationContext, n)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {

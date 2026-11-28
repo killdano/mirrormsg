@@ -543,6 +543,7 @@ class PebbleListenerService : BasePebbleListenerService() {
      *  updates live (new message bumps that convo to the top). */
     suspend fun refreshConversationList() {
         try {
+            if (People.active()) return   // New chat's people on the watch: no chats to refresh
             val svc = Mirror.activeService() ?: return
             // Pin context BEFORE the fetch: an account switch mid-fetch must not
             // let this list be cached under (or streamed as) the new account's.
@@ -576,7 +577,10 @@ class PebbleListenerService : BasePebbleListenerService() {
         // both use the real screen width. Absent => cache unchanged (defaults to 0 →
         // 144-equivalent behavior everywhere it's consumed).
         (data[Schema.KEY_REQ_DISPLAY_W] as? PebbleDictionaryItem.Int32)?.value?.let {
-            if (it > 0) Mirror.watchDisplayW = it
+            if (it > 0 && it != Mirror.lastWatchW) LogStore.i(TAG,
+                "Watch display width $it (was ${Mirror.lastWatchW}); emoji substitution " +
+                (if (it > 144) "off for this watch" else "available"))
+            if (it > 0) Mirror.noteWatchWidth(applicationContext, it)
         }
         (data[Schema.KEY_REQ_ANIM_THUMB] as? PebbleDictionaryItem.Int32)?.value?.let {
             Mirror.watchAnimThumbs = it == 1
@@ -623,6 +627,22 @@ class PebbleListenerService : BasePebbleListenerService() {
                 LogStore.w(TAG, "Draft op $draftOp for no known chat; ignored")
                 return ReceiveResult.Ack
             }
+            // The New chat screen's draft is its filter (People.kt): it narrows the people
+            // and is never sent.
+            if (convoId == People.DRAFT_ID) {
+                if (!People.active()) return ReceiveResult.Ack
+                when (draftOp) {
+                    Schema.DRAFT_ADD -> DraftStore.append(this, convoId,
+                        (data[Schema.KEY_DRAFT_TEXT] as? PebbleDictionaryItem.Text)?.value.orEmpty())
+                    Schema.DRAFT_CLEAR -> DraftStore.set(this, convoId, "")
+                    Schema.DRAFT_GET -> { scope.launch { sendFullDraft(convoId) }; return ReceiveResult.Ack }
+                    Schema.DRAFT_SET -> if (!draftPiece(convoId, data)) return ReceiveResult.Ack
+                    else -> return ReceiveResult.Ack   // (a send: nothing to send)
+                }
+                LogStore.i(TAG, "New chat: filter now ${DraftStore.get(this, convoId).length} chars")
+                scope.launch { streamPeople() }
+                return ReceiveResult.Ack
+            }
             when (draftOp) {
                 Schema.DRAFT_ADD -> {
                     val piece = (data[Schema.KEY_DRAFT_TEXT] as? PebbleDictionaryItem.Text)?.value.orEmpty()
@@ -660,6 +680,15 @@ class PebbleListenerService : BasePebbleListenerService() {
         val diag = (data[Schema.KEY_DIAG] as? PebbleDictionaryItem.Text)?.value
         if (diag != null) {
             LogStore.i(TAG, "WATCH-DIAG: $diag")
+            return ReceiveResult.Ack
+        }
+
+        // New chat (People.kt): the switcher's top row, for switcher entry N: its people,
+        // as a list level.
+        val reqNewChat = (data[Schema.KEY_REQ_NEWCHAT] as? PebbleDictionaryItem.Int32)?.value
+        if (reqNewChat != null) {
+            LogStore.i(TAG, "Watch: New chat on switcher entry $reqNewChat")
+            scope.launch { startPeople(reqNewChat) }
             return ReceiveResult.Ack
         }
 
@@ -702,7 +731,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             if (spanCount > 0) Mirror.convoSpanCount = spanCount   // watch size (10 Basalt / 20 Emery); drives drill-arrow pad
             LogStore.i(TAG, "Watch requested convo span @$reqSpan count=$spanCount")
             scope.launch {
-                val json = (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
+                val json = if (People.active()) People.listJson(DraftStore.get(this@PebbleListenerService, People.DRAFT_ID))
+                    else (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
                     ?: Mirror.activeService()?.listContext(CONVO_CAP, Mirror.navStack.toList())
                 if (json != null) {
                     val total = rebuildConvoIndex(json)
@@ -738,6 +768,34 @@ class PebbleListenerService : BasePebbleListenerService() {
         val roomBack = (data[Schema.KEY_ROOM_BACK] as? PebbleDictionaryItem.Int32)?.value
         if (roomBack != null) {
             scope.launch { leaveRoom(roomBack) }
+            return ReceiveResult.Ack
+        }
+        // Call (Calls.kt): picked in the watch's reply menu, for the chat on its screen. Its
+        // thread token must be the open chat's, so a stale request calls no one.
+        val reqCall = (data[Schema.KEY_REQ_CALL] as? PebbleDictionaryItem.Int32)?.value
+        if (reqCall != null) {
+            val convoId = Mirror.currentOpenConvoId
+            if (convoId == null || threadToken(convoId) != reqCall) {
+                LogStore.w(TAG, "Call for a chat that isn't the one open; ignored")
+            } else {
+                val svcId = Mirror.activeService()?.id
+                scope.launch { Calls.start(applicationContext, convoId, svcId) }
+            }
+            return ReceiveResult.Ack
+        }
+        // A reaction (the watch's React row, or the emoji list it opens): on a message of
+        // the chat on screen, named by its token, so one for a chat no longer open goes
+        // nowhere. Never sent as a message.
+        val reqReact = (data[Schema.KEY_REQ_REACT] as? PebbleDictionaryItem.Text)?.value
+        if (reqReact != null) {
+            val convoId = Mirror.currentOpenConvoId
+            val tok = (data[Schema.KEY_DRAFT_TOK] as? PebbleDictionaryItem.Int32)?.value
+            if (convoId == null || (tok != null && threadToken(convoId) != tok)) {
+                LogStore.w(TAG, "Reaction for a chat that isn't the one open; ignored")
+            } else {
+                val target = targetByHash((data[Schema.KEY_REPLY_TO_INDEX] as? PebbleDictionaryItem.Int32)?.value ?: -1, reqHash)
+                scope.launch { sendReaction(convoId, target, reqReact) }
+            }
             return ReceiveResult.Ack
         }
         // Emoji actions (step 100): a feed's action (a like, a vote) on a message of the
@@ -908,7 +966,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         // misfire for a chat the user already backed out of. Fire-and-forget and
         // idempotent; a dropped signal self-heals on the next open or app close.
         if (data[Schema.KEY_THREAD_CLOSED] != null) {
-            LogStore.i(TAG, "Watch left thread view — clearing open convo (was ${Mirror.currentOpenConvoId})")
+            val closedConvoId = Mirror.currentOpenConvoId
+            LogStore.i(TAG, "Watch left thread view — clearing open convo (was $closedConvoId)")
             // Forget where the ladder ended up for this thread's animations. A rung
             // is bumped because the watch could not hold something AT THAT MOMENT —
             // often fragmentation rather than size — so carrying it forever would
@@ -916,6 +975,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             // position lasts as long as the viewing session and no longer.
             Mirror.clearGifRungs()
             Mirror.currentOpenConvoId = null
+            // A chat opened from a message card on a map app: Back brings that app back.
+            MapCard.onThreadClosed(applicationContext, closedConvoId)
             return ReceiveResult.Ack
         }
 
@@ -1053,18 +1114,48 @@ class PebbleListenerService : BasePebbleListenerService() {
             // failed one stays failed, its own error in the log rather than the refusal.
             // In a reply room (step 99) one from the chat answers the post at its top. In
             // a feed an emoji is a reply too (step 100: its like is an action of its own).
+            // A watch that asks for reactions outright (IMGCAP_REACT) sends emoji picked
+            // to write as text: only an older one's emoji reply is a reaction.
             val target = if (targetIndex < 0) roomPostRow(convoId) else targetIndex
+            val reactOk = (Mirror.watchCaps and Schema.IMGCAP_REACT) == 0
             if (target >= 0) {
                 if (sendTargeted(convoId, target, text,
-                        allowReact = targetIndex >= 0 && !Mirror.isFeed(convoId))) return
+                        allowReact = reactOk && targetIndex >= 0 && !Mirror.isFeed(convoId))) return
                 if (Mirror.isFeed(convoId)) {
                     LogStore.w(TAG, "Feed reply not sent (a feed takes no plain messages)")
+                    WatchNotice.post(this, "Reply not sent", "This post didn't take the reply.")
                     return
                 }
             }
-            sendReplyInternal(convoId, route, text)
+            if (!sendReplyInternal(convoId, route, text))
+                WatchNotice.post(this, "Message not sent", "The network didn't take it. Try again from the watch.")
         } catch (e: Exception) {
             LogStore.e(TAG, "sendReply failed", e)
+        }
+    }
+
+    /**
+     * A reaction asked for outright (KEY_REQ_REACT): [emoji] on message [target] of the
+     * open chat, as a reaction only (the same one again takes it back, where the network
+     * can). One the network can't take says so on the watch, as a notification.
+     */
+    private suspend fun sendReaction(convoId: String, target: Int, emoji: String) {
+        try {
+            if (target < 0) {
+                LogStore.w(TAG, "Reaction with no message to go to; not sent")
+                return
+            }
+            val svc = Mirror.activeService()
+            if (svc == null || !svc.supportsReactionSend || !isEmojiOnly(emoji)) {
+                LogStore.w(TAG, "Reaction not sent (this chat's network takes none)")
+                WatchNotice.post(this, "Reaction not sent", "This chat doesn't take reactions.")
+                return
+            }
+            if (!sendTargeted(convoId, target, emoji, allowReact = true)) {
+                WatchNotice.post(this, "Reaction not sent", "The network didn't take it.")
+            }
+        } catch (e: Exception) {
+            LogStore.e(TAG, "sendReaction failed", e)
         }
     }
 
@@ -1387,6 +1478,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             LogStore.e(TAG, "sendDraft failed", e)
         }
         LogStore.w(TAG, "Draft not sent; kept (${text.length} chars)")
+        WatchNotice.post(this, "Message not sent", "Your draft is kept.")
         DraftStore.restore(this, convoId, text)
         pushDraft(convoId)
     }
@@ -1440,7 +1532,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             DraftStore.set(this, convoId, old.substring(0, base.coerceIn(0, old.length)) + text)
         }
         LogStore.i(TAG, "Draft from the keyboard: ${text.length} chars (mode $mode)")
-        if (mode == Schema.DSET_SEND || mode == Schema.DSET_ADD_SEND) {
+        if ((mode == Schema.DSET_SEND || mode == Schema.DSET_ADD_SEND) && convoId != People.DRAFT_ID) {
             val full = DraftStore.take(this, convoId)
             if (full.isNotBlank()) {
                 LogStore.i(TAG, "Draft send: ${full.length} chars (target=$target)")
@@ -1506,7 +1598,9 @@ class PebbleListenerService : BasePebbleListenerService() {
             val r = KbDecoder.decode(this, taps, lit, prev)
             val out = java.io.ByteArrayOutputStream()
             out.write(seq)
-            out.write((if (r.auto) Schema.KS_AUTO else 0) or (if (r.predict) Schema.KS_PREDICT else 0))
+            // On New chat's people the words are names: never swapped for dictionary words.
+            val auto = r.auto && !People.active()
+            out.write((if (auto) Schema.KS_AUTO else 0) or (if (r.predict) Schema.KS_PREDICT else 0))
             out.write(r.words.joinToString("\u001F").toByteArray(Charsets.UTF_8))
             sendImgFrame(Mirror.sender(this), mapOf(Schema.KEY_KB_SUGG to PebbleDictionaryItem.Bytes(out.toByteArray())))
             val ms = System.currentTimeMillis() - t0
@@ -1557,7 +1651,14 @@ class PebbleListenerService : BasePebbleListenerService() {
      *  indexing as KEY_REQ_OPEN), resolved against the current context's entries. */
     private suspend fun navigateContext(entry: Int) {
         try {
-            if (entry < 0) {
+            if (entry < 0 && People.active()) {
+                leavePeople()                 // Back off New chat: the account's chats again
+            } else if (entry >= 0 && People.active()) {
+                // Its "type more" / "none" row: the list again (loaded again if it failed).
+                if (People.loadFailed || People.all.isEmpty()) loadPeople()
+                streamPeople()
+                return
+            } else if (entry < 0) {
                 if (Mirror.navStack.isNotEmpty())
                     Mirror.navStack.removeAt(Mirror.navStack.size - 1)
                 else {
@@ -1584,9 +1685,141 @@ class PebbleListenerService : BasePebbleListenerService() {
         }
     }
 
+    // ---- New chat (People.kt) ------------------------------------------------------
+    // The watch's switcher starts a chat: its people as a list level (navStack's
+    // People.CTX), filtered by the screen's draft (its token: People.DRAFT_ID's),
+    // and Select on a person opens the chat with them.
+
+    /** New chat on switcher entry [idx]: that account's people, the filter empty. */
+    private suspend fun startPeople(idx: Int) {
+        try {
+            val entry = Mirror.lastSwitcherEntries.getOrNull(idx)
+            if (entry != null && (entry.serviceId != Mirror.activeServiceId ||
+                    entry.folderId != Mirror.activeTgFolder || entry.guildId != Mirror.activeDiscordGuild)) {
+                LogStore.i(TAG, "New chat: account -> entry $idx (svc=${entry.serviceId})")
+                Mirror.activeServiceId = entry.serviceId
+                Mirror.activeTgFolder = entry.folderId
+                Mirror.activeDiscordGuild = entry.guildId
+                reportServiceList()
+            }
+            DraftStore.set(this, People.DRAFT_ID, "")
+            draftChats[threadToken(People.DRAFT_ID)] = People.DRAFT_ID
+            Mirror.navStack.clear()
+            Mirror.navStack.add(People.CTX)
+            loadPeople()
+            streamPeople()
+        } catch (e: Exception) {
+            LogStore.e(TAG, "startPeople failed", e)
+        }
+    }
+
+    /** The active account's people, those it has chats with first (its list's order). */
+    private fun loadPeople() {
+        val svc = Mirror.activeService()
+        val t0 = System.currentTimeMillis()
+        val raw = try {
+            if (svc?.supportsNewChat == true) svc.listPeople() else ""
+        } catch (e: Throwable) {
+            LogStore.e(TAG, "New chat: listPeople failed on ${svc?.id}", e)
+            ""
+        }
+        val chats = try {
+            val arr = JSONObject(Mirror.getCachedConvoJson() ?: "{}").optJSONArray("conversations")
+            (0 until (arr?.length() ?: 0)).map { arr!!.getJSONObject(it).optString("conversationID") }
+        } catch (_: Exception) { emptyList() }
+        People.load(raw, chats)
+        LogStore.i(TAG, "New chat: ${People.all.size} people on ${svc?.id} in " +
+            "${System.currentTimeMillis() - t0} ms" + (if (People.loadFailed) " (couldn't read them)" else ""))
+    }
+
+    /** The people matching the filter, as the watch's list, then the filter for its bar. */
+    private suspend fun streamPeople() {
+        if (!People.active()) return
+        val filter = DraftStore.get(this, People.DRAFT_ID)
+        streamConvos(People.listJson(filter))
+        if (!watchSendAllowed()) return
+        try {
+            sendImgFrame(Mirror.sender(this), mapOf(
+                Schema.KEY_DRAFT_OP   to PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID)),
+                Schema.KEY_DRAFT_TEXT to PebbleDictionaryItem.Text(draftForWatch(filter))
+            ))
+        } catch (e: Exception) {
+            LogStore.e(TAG, "New chat: filter not sent", e)
+        }
+    }
+
+    /** Off the people screen: its level and its filter go. */
+    private fun leavePeople() {
+        if (Mirror.navStack.lastOrNull() == People.CTX) Mirror.navStack.removeAt(Mirror.navStack.size - 1)
+        DraftStore.set(this, People.DRAFT_ID, "")
+        People.clear()
+    }
+
+    /** A network's chat entry's SIM routing (Google Messages'), null when it has none. */
+    private fun routeOf(c: JSONObject): Mirror.SimRoute? {
+        if (!c.has("defaultOutgoingID") && !c.has("simCard")) return null
+        val sp = c.optJSONObject("simCard")?.optJSONObject("SIMData")?.optJSONObject("SIMPayload")
+        return Mirror.SimRoute(c.optString("defaultOutgoingID", "2"),
+            (sp?.optInt("two", 2) ?: 2).toLong(), (sp?.optInt("SIMNumber", 2) ?: 2).toLong())
+    }
+
+    /**
+     * The person on row [row] of the people screen picked: the network gives the chat
+     * with them (theirs, or a new one), which opens on the watch (empty for a new one;
+     * its first send makes it on the network), over the account's chats (Back lands
+     * there, as from any chat).
+     */
+    private suspend fun openPersonChat(row: Int) {
+        val p = People.shown.getOrNull(row)
+        val svc = Mirror.activeService()
+        if (p == null || svc == null) {
+            LogStore.w(TAG, "New chat: no person at row $row")
+            streamPeople()
+            return
+        }
+        val t0 = System.currentTimeMillis()
+        val res = try { svc.openPerson(p.id) } catch (e: Throwable) {
+            LogStore.e(TAG, "New chat: openPerson failed on ${svc.id}", e)
+            ""
+        }
+        val c = try { JSONObject(res) } catch (_: Exception) { null }
+        val convoId = c?.optString("conversationID").orEmpty()
+        if (c == null || convoId.isEmpty()) {
+            LogStore.w(TAG, "New chat: ${svc.id} gave no chat (${(c?.optString("error") ?: c?.optString("dcError")).orEmpty().take(120)})")
+            WatchNotice.post(this, "Chat not started", "${svc.displayName} couldn't start that chat.")
+            return
+        }
+        LogStore.i(TAG, "New chat: chat opened on ${svc.id} in ${System.currentTimeMillis() - t0} ms")
+        leavePeople()
+        Mirror.currentOpenConvoId = convoId
+        Mirror.currentOpenRoute = routeOf(c)
+        Mirror.backfillExhausted.remove(convoId)
+        Mirror.currentMsgPage = 0
+        try {
+            // The account's chats under it (the level its chats live on, as a force-open's).
+            Mirror.navStack.clear()
+            Mirror.navStack.addAll(svc.forceOpenNavContext(convoId))
+            val json = (if (Mirror.navStack.isEmpty()) Mirror.getCachedConvoJson() else null)
+                ?: svc.listContext(CONVO_CAP, Mirror.navStack.toList())
+            val total = rebuildConvoIndex(json)
+            streamConvoSpan(json, 0, total)
+            val pnRow = Mirror.convoOrder.indexOf(convoId)   // -1: a new chat, not listed yet
+            if (pnRow >= 0) Mirror.currentOpenRoute = Mirror.currentOpenRoute ?: Mirror.simRoutes.getOrNull(pnRow)
+            streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+            pushDraft(convoId)
+            val f = svc.fetchMessages(convoId, FETCH_COUNT, "")
+            val added = MessageStore.merge(this, convoId, JSONObject(f).optJSONArray("messages") ?: JSONArray())
+            if (added > 0 && Mirror.currentOpenConvoId == convoId)
+                streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+        } catch (e: Exception) {
+            LogStore.w(TAG, "New chat: the chat's messages didn't come (${e.message?.take(120)})")
+        }
+    }
+
     // ---- Open thread: store-first, then catch-up ---------------------------
 
     private suspend fun openThread(row: Int) {
+        if (People.active()) { openPersonChat(row); return }   // New chat: a person picked
         // Defensive: if the watch opens an ENTER row (bucket/server), drill instead of
         // trying to open a non-existent thread. Normally the watch sends KEY_REQ_ENTER
         // for these, so this only catches a mismatch.
@@ -3304,6 +3537,10 @@ class PebbleListenerService : BasePebbleListenerService() {
                 if (acts.isNotEmpty())
                     frame[Schema.KEY_THREAD_ACTIONS] = PebbleDictionaryItem.Int32(actionsField(acts))
             }
+            // A chat Calls can call: a Call row in the watch's reply menu, on every frame.
+            if ((Mirror.watchCaps and Schema.IMGCAP_CALL) != 0 &&
+                Calls.target(convoId, Mirror.activeService()?.id) != null)
+                frame[Schema.KEY_THREAD_CALL] = PebbleDictionaryItem.Int32(1)
             // A reply room (step 99): how deep, on its every frame (and the feed's after a
             // Back); where the watch lands.
             if (roomNav || Rooms.isRoom(convoId))
@@ -3741,10 +3978,10 @@ class PebbleListenerService : BasePebbleListenerService() {
 
     // ---- Chat-row preview cache (see thumbCache) ------------------------------
 
-    /** The cache key of a preview: chat, media (or the inline bytes), kind, and the colour settings it was encoded under. */
+    /** The cache key of a preview: chat, media (or the inline bytes), kind, and the Pictures stop it was encoded under. */
     private fun thumbKey(convoId: String, mediaID: String, inline: String, kind: String): String {
         val src = if (mediaID.isNotEmpty()) mediaID else "i${inline.length}:${inline.hashCode()}"
-        return "$convoId|$src|$kind|${Mirror.imgThumbCap}|${Mirror.imgThumbCoverage}"
+        return "$convoId|$src|$kind|q${Mirror.imgQuality}"
     }
 
     private fun thumbHave(key: String): Boolean =
@@ -4053,7 +4290,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             var bandComp: Array<RowComp>? = null
             var sendStream = pixels          // legacy single-segment stream (small / short-full)
             var restartIndex: ByteArray? = null
-            if (Mirror.imgCompress && full && imgFormat == 1) {
+            if (full && imgFormat == 1) {
                 val tight = tightRows(pixels, w, imgDepth)   // strip word-align padding
                 if (tight != null) {
                     if (banded) {
@@ -4313,9 +4550,8 @@ class PebbleListenerService : BasePebbleListenerService() {
     private val fullPrepGate = Semaphore(FULL_PREP_PARALLEL)
     private val fullPrepJobs = java.util.Collections.synchronizedList(mutableListOf<kotlinx.coroutines.Job>())
 
-    private fun fullSettings(): String =
-        "${Mirror.imgFullCap}|${Mirror.imgFullCoverage}|${Mirror.imgCompress}|${Mirror.imgDither}|" +
-        "${Mirror.imgDitherCompress}|${Mirror.imgDitherIntensity}"
+    // Every encoder setting comes from the one Pictures stop (Mirror.pushImageConfig).
+    private fun fullSettings(): String = "q${Mirror.imgQuality}"
 
     private fun fullSrc(mediaID: String, inline: String): String =
         if (mediaID.isNotEmpty()) mediaID else "i${inline.length}:${inline.hashCode()}"
@@ -4555,12 +4791,14 @@ class PebbleListenerService : BasePebbleListenerService() {
             // the active account a REAL logged-in one (the persisted id — or the
             // "google" default — may name a wiped account), so we never boot the
             // watch into a dead account with an empty list and broken nav.
-            Mirror.ensureActiveLoggedIn(this)
-            val svc = Mirror.activeService() ?: run {
-                // Nothing logged in (e.g. right after a full wipe). Still send the
-                // authoritative (empty) roster so the watch discards its stale
-                // account list instead of showing accounts that no longer exist.
-                LogStore.w(TAG, "No service for auto-push — reporting empty roster")
+            // Use what ensureActiveLoggedIn resolved, not Mirror.activeService():
+            // with nothing logged in, activeService() still names the logged-out
+            // account, and its cached list used to stream to the watch.
+            val svc = Mirror.ensureActiveLoggedIn(this) ?: run {
+                // Nothing logged in (a logout, or right after a full wipe). Send
+                // only the authoritative (empty) roster: the watch drops its saved
+                // list and asks the user to log in on the phone. No list follows.
+                LogStore.w(TAG, "Nothing logged in — reporting empty roster, no list")
                 reportServiceList()
                 return
             }
@@ -4725,6 +4963,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             frame[Schema.KEY_SERVICES]       = PebbleDictionaryItem.Text(labels)
             frame[Schema.KEY_ACTIVE_SERVICE] = PebbleDictionaryItem.Int32(activeIdx)
             frame[Schema.KEY_SERVICE_FLAGS]  = PebbleDictionaryItem.Int32(serviceFlags)
+            // New chat (People.kt): the entries that can start one, the switcher's top row.
+            frame[Schema.KEY_NEWCHAT_MASK]   = PebbleDictionaryItem.Int32(Mirror.newChatMask(this, entries))
             // 1 if the active service supports reaction-send (watch uses this to
             // keep the chat put on a reaction vs jump to bottom on a message).
             val activeSvcId = entries.getOrNull(activeIdx)?.serviceId ?: Mirror.activeServiceId
@@ -4755,11 +4995,15 @@ class PebbleListenerService : BasePebbleListenerService() {
      *
      * Safe to call liberally (e.g. every poll cycle) — the signature diff drops
      * no-op calls so it won't spam the watch. Runs on the service scope, needs no
-     * Activity: call via PebbleListenerService.instance?.refreshSwitcher().
+     * Activity: call via PebbleListenerService.instance?.refreshSwitcher(). Also
+     * called on a logout and when a Beeper account (or Beeper itself) is switched
+     * off or on.
      *
-     * Note: like reportServiceList(), this only pushes a rail for 2+ logged-in
-     * accounts; a drop to a single account doesn't actively collapse an already-
-     * shown rail (pre-existing behaviour of the 2+ gate, unchanged here).
+     * With the watchapp open, a change that leaves nothing logged in, brings the
+     * first account back, or takes away the active account re-syncs the watch in
+     * full (pushConversations: the roster and the active account's list, or only
+     * the empty roster, which makes the watch drop its list and ask to log in).
+     * Any other change re-sends only the rail, so the watch keeps its place.
      */
     fun refreshSwitcher() {
         scope.launch {
@@ -4769,7 +5013,15 @@ class PebbleListenerService : BasePebbleListenerService() {
                           "|" + Mirror.activeServiceId + "|" + Mirror.activeTgFolder + "|" + Mirror.activeDiscordGuild
                 if (sig == lastSwitcherSig) return@launch
                 lastSwitcherSig = sig
-                reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                val full = Mirror.watchAppOpen && (entries.isEmpty() ||
+                    Mirror.lastSwitcherEntries.isEmpty() ||
+                    Mirror.activeService()?.isLoggedIn() != true)
+                if (full) {
+                    LogStore.i(TAG, "Accounts changed (${entries.size} logged in) — full watch resync")
+                    pushConversations()
+                } else {
+                    reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                }
             } catch (e: Exception) {
                 LogStore.e(TAG, "refreshSwitcher failed", e)
             }
@@ -4847,7 +5099,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         if (!watchSendAllowed()) return
         val arr = JSONObject(json).getJSONArray("conversations")
         val sender = Mirror.sender(this@PebbleListenerService)
-        val ownerSvc = Mirror.activeService()
+        val people = People.active()
+        val ownerSvc = if (people) null else Mirror.activeService()   // (people rows: no photos)
         val s = start.coerceIn(0, maxOf(0, total - 1))
         val end = minOf(s + slots, total)
         val len = (end - s).coerceAtLeast(0)
@@ -4862,6 +5115,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             cf[Schema.KEY_LIST_ABS]    = PebbleDictionaryItem.Int32(0)
             cf[Schema.KEY_LIST_TOTAL]  = PebbleDictionaryItem.Int32(0)
             cf[Schema.KEY_LIST_HAS_PARENT] = PebbleDictionaryItem.Int32(if (hasParent) 1 else 0)
+            if (people) cf[Schema.KEY_PEOPLE] = PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID))
             attachFirstFrameConfig(cf)
             sender.sendDataToPebble(Schema.WATCH_UUID, cf, watches = null)
             LogStore.i(TAG, "Streamed convo span (empty list, total=0) to watch")
@@ -4900,6 +5154,8 @@ class PebbleListenerService : BasePebbleListenerService() {
         frame[Schema.KEY_LIST_ABS]    = PebbleDictionaryItem.Int32(s)
         frame[Schema.KEY_LIST_TOTAL]  = PebbleDictionaryItem.Int32(total)
         frame[Schema.KEY_LIST_HAS_PARENT] = PebbleDictionaryItem.Int32(if (hasParent) 1 else 0)
+        // New chat's people (People.kt): the screen's token, on every frame of them.
+        if (people) frame[Schema.KEY_PEOPLE] = PebbleDictionaryItem.Int32(threadToken(People.DRAFT_ID))
         attachFirstFrameConfig(frame)
         sender.sendDataToPebble(Schema.WATCH_UUID, frame, watches = null)
         LogStore.i(TAG, "Streamed convo blob [$s,${s + packed}) of $total to watch " +
@@ -5073,6 +5329,8 @@ class PebbleListenerService : BasePebbleListenerService() {
             // (the flag was previously never cleared, so the last-open convo
             // kept getting pushed forever).
             Mirror.currentOpenConvoId = null
+            // A chat opened from a map app's message card no longer brings it back.
+            MapCard.onWatchAppClosed()
             LogStore.i(TAG, "Watchapp closed")
         }
     }

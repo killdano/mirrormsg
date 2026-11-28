@@ -9,8 +9,10 @@
 // JNI boundary cleanly. So everything that touches gmproto / libgm internals
 // stays on the Go side of this file; Kotlin only ever sees JSON strings.
 //
-// Pinned against libgm v0.2605.0 (May 2026). If Google changes the protocol and
-// libgm bumps, re-check the spots marked "VERIFY" below against the new source.
+// Pinned against libgm v0.2605.0 (May 2026), with one Google-account pairing fix
+// backported (third_party/mautrix-gmessages/MIRRORMSG-PATCH.md). If Google
+// changes the protocol and libgm bumps, re-check the spots marked "VERIFY" below
+// against the new source.
 package mirrorbridge
 
 import (
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"image"
 	png_pkg "image/png"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -38,7 +41,8 @@ import (
 // EventSink is implemented on the Kotlin side. The Go event loop calls OnEvent
 // for every incoming message, conversation update, pairing step, etc.
 //   - eventType is a stable string tag (MESSAGE, CONVERSATION, PAIR_EMOJI,
-//     PAIRED, LOGGED_OUT, USER_ALERT, ACCOUNT_CHANGE, UNKNOWN).
+//     PAIR_STEP, PAIR_LOG, PAIR_FAILED, PAIRED, LOGGED_OUT, USER_ALERT,
+//     ACCOUNT_CHANGE, UNKNOWN).
 //   - jsonPayload is the event marshaled to JSON.
 //
 // gomobile turns this into a Java/Kotlin interface you implement and pass in.
@@ -54,12 +58,19 @@ type Bridge struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	mu     sync.Mutex
+
+	// Pairing (bridge_pair.go): the logger, and the tap that copies libgm's
+	// log lines to the sink while a pairing runs.
+	log zerolog.Logger
+	tap *pairTap
 }
 
-func newLogger() zerolog.Logger {
+func newLogger(tap *pairTap) zerolog.Logger {
 	// Logs go to stderr, which shows up in Logcat under the process. Drop the
-	// level to Debug while spiking; raise it later.
-	return zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
+	// level to Debug while spiking; raise it later. The tap forwards a filtered
+	// copy to the app's own log while a pairing runs (see pairTap).
+	return zerolog.New(io.MultiWriter(
+		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}, tap)).
 		Level(zerolog.DebugLevel).
 		With().Timestamp().Logger()
 }
@@ -111,13 +122,17 @@ func NewBridge(sessionJSON string, sink EventSink) (*Bridge, error) {
 			return nil, fmt.Errorf("failed to restore session: %w", err)
 		}
 	}
-	client := libgm.NewClient(authData, nil, newLogger())
+	tap := &pairTap{sink: sink}
+	logger := newLogger(tap)
+	client := libgm.NewClient(authData, nil, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Bridge{
 		client: client,
 		sink:   sink,
 		ctx:    ctx,
 		cancel: cancel,
+		log:    logger,
+		tap:    tap,
 	}
 	client.SetEventHandler(b.handleEvent)
 	return b, nil
@@ -126,7 +141,12 @@ func NewBridge(sessionJSON string, sink EventSink) (*Bridge, error) {
 // emit marshals payload (a proto.Message, a pre-built JSON string, or any
 // json-able value) and forwards it to the Kotlin sink under the given tag.
 func (b *Bridge) emit(eventType string, payload any) {
-	if b.sink == nil {
+	emitTo(b.sink, eventType, payload)
+}
+
+// emitTo is emit for code that has the sink but not the Bridge (pairTap).
+func emitTo(sink EventSink, eventType string, payload any) {
+	if sink == nil {
 		return
 	}
 	var data string
@@ -148,7 +168,7 @@ func (b *Bridge) emit(eventType string, payload any) {
 			data = string(bytes)
 		}
 	}
-	b.sink.OnEvent(eventType, data)
+	sink.OnEvent(eventType, data)
 }
 
 // handleEvent is libgm's EventHandler (func(evt any)). We type-switch on the
@@ -201,17 +221,7 @@ func (b *Bridge) SetCookies(cookiesJSON string) error {
 	return nil
 }
 
-// StartGaiaPairing performs Google-account pairing. It BLOCKS until pairing
-// completes or fails. While in progress it emits a "PAIR_EMOJI" event carrying
-// the emoji you must confirm on your phone. On success the session is paired —
-// call ExportSession to persist, then Connect. Requires SetCookies first.
-func (b *Bridge) StartGaiaPairing() error {
-	return b.client.DoGaiaPairing(b.ctx, func(emoji string) {
-		// The func(string) is created here on the Go side, so nothing has to
-		// cross JNI — we just forward the emoji to Kotlin via the sink.
-		b.emit("PAIR_EMOJI", fmt.Sprintf(`{"emoji":%q}`, emoji))
-	})
-}
+// StartGaiaPairing and SetPairingTarget live in bridge_pair.go.
 
 // ---- Pairing: QR path (alternative) ----------------------------------------
 
@@ -445,24 +455,87 @@ func (b *Bridge) MarkRead(conversationID, messageID string) (string, error) {
 	return string(out), nil
 }
 
-// VERIFY: ContactNumber field population. The bridge derives Number /
-// FormattedNumber / MysteriousInt via libphonenumber; here we set the obvious
-// ones. Confirm against msgconv if creation fails.
+// StartNewConversation returns the conversation with phoneNumber, creating it when
+// there is none (GetOrCreateConversation), as protojson of the response. The number
+// is given the way mautrix-gmessages' ResolveIdentifier gives it (startchat.go).
 func (b *Bridge) StartNewConversation(phoneNumber string) (string, error) {
 	req := &gmproto.GetOrCreateConversationRequest{
-		Numbers: []*gmproto.ContactNumber{
-			{
-				// Number is a plain string; FormattedNumber is *string.
-				Number:          phoneNumber,
-				FormattedNumber: &phoneNumber,
-			},
-		},
+		Numbers: []*gmproto.ContactNumber{{
+			MysteriousInt: 2,
+			Number:        phoneNumber,
+			Number2:       phoneNumber,
+		}},
 	}
 	resp, err := b.client.GetOrCreateConversation(req)
 	if err != nil {
 		return "", err
 	}
 	bytes, err := protojson.Marshal(resp)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+// ListPeople returns the contacts a new chat can start with (the watch's New chat):
+// the ones written to most first (ListTopContacts), then the rest of the list, as
+// {"people":[{"id","name","detail","rank","color"}]}. id is the number
+// OpenPerson takes; rank 1.. for the top ones.
+func (b *Bridge) ListPeople() (string, error) {
+	type person struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail,omitempty"`
+		Rank   int    `json:"rank,omitempty"`
+		Color  string `json:"color,omitempty"`
+	}
+	out := []person{}
+	add := func(cs []*gmproto.Contact, ranked bool) {
+		for i, c := range cs {
+			num := c.GetNumber()
+			if num == nil || num.GetNumber() == "" || c.GetName() == "" {
+				continue
+			}
+			p := person{ID: num.GetNumber(), Name: c.GetName(), Detail: num.GetFormattedNumber(),
+				Color: c.GetAvatarHexColor()}
+			if p.Detail == "" {
+				p.Detail = num.GetNumber()
+			}
+			if ranked {
+				p.Rank = i + 1
+			}
+			out = append(out, p)
+		}
+	}
+	if top, err := b.client.ListTopContacts(); err == nil {
+		add(top.GetContacts(), true)
+	}
+	all, err := b.client.ListContacts()
+	if err != nil && len(out) == 0 {
+		return "", err
+	}
+	if err == nil {
+		add(all.GetContacts(), false)
+	}
+	bs, _ := json.Marshal(map[string]any{"people": out})
+	return string(bs), nil
+}
+
+// OpenPerson returns the conversation with the number from ListPeople (theirs, or a
+// new one Google Messages makes now) as its protojson Conversation: the same fields
+// ListConversations gives for it, so its SIM routing reads the same way.
+func (b *Bridge) OpenPerson(number string) (string, error) {
+	req := &gmproto.GetOrCreateConversationRequest{
+		Numbers: []*gmproto.ContactNumber{{MysteriousInt: 2, Number: number, Number2: number}},
+	}
+	resp, err := b.client.GetOrCreateConversation(req)
+	if err != nil {
+		return "", err
+	}
+	if resp.GetConversation() == nil {
+		return "", fmt.Errorf("no conversation (status %v)", resp.GetStatus())
+	}
+	bytes, err := protojson.Marshal(resp.GetConversation())
 	if err != nil {
 		return "", err
 	}
