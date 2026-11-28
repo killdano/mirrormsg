@@ -4687,17 +4687,6 @@ class PebbleListenerService : BasePebbleListenerService() {
     }
 
     /**
-     * Re-syncs the open watchapp after a logout on the phone: the new roster, and
-     * the list of whichever account is active now, or only the empty roster when
-     * nothing is logged in. Nothing is sent while the watchapp is closed (the next
-     * open does the same resync).
-     */
-    fun resyncAfterLogout() {
-        if (!Mirror.watchAppOpen) return
-        scope.launch { pushConversations() }
-    }
-
-    /**
      * Pushes the CURRENTLY ACTIVE service's conversations after an account switch
      * (KEY_REQ_SERVICE), cache-first: the account's own last-known root list (the
      * per-account cache) streams IMMEDIATELY, then a background fetch re-streams
@@ -4831,11 +4820,15 @@ class PebbleListenerService : BasePebbleListenerService() {
      *
      * Safe to call liberally (e.g. every poll cycle) — the signature diff drops
      * no-op calls so it won't spam the watch. Runs on the service scope, needs no
-     * Activity: call via PebbleListenerService.instance?.refreshSwitcher().
+     * Activity: call via PebbleListenerService.instance?.refreshSwitcher(). Also
+     * called on a logout and when a Beeper account (or Beeper itself) is switched
+     * off or on.
      *
-     * Note: like reportServiceList(), this only pushes a rail for 2+ logged-in
-     * accounts; a drop to a single account doesn't actively collapse an already-
-     * shown rail (pre-existing behaviour of the 2+ gate, unchanged here).
+     * With the watchapp open, a change that leaves nothing logged in, brings the
+     * first account back, or takes away the active account re-syncs the watch in
+     * full (pushConversations: the roster and the active account's list, or only
+     * the empty roster, which makes the watch drop its list and ask to log in).
+     * Any other change re-sends only the rail, so the watch keeps its place.
      */
     fun refreshSwitcher() {
         scope.launch {
@@ -4845,7 +4838,15 @@ class PebbleListenerService : BasePebbleListenerService() {
                           "|" + Mirror.activeServiceId + "|" + Mirror.activeTgFolder + "|" + Mirror.activeDiscordGuild
                 if (sig == lastSwitcherSig) return@launch
                 lastSwitcherSig = sig
-                reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                val full = Mirror.watchAppOpen && (entries.isEmpty() ||
+                    Mirror.lastSwitcherEntries.isEmpty() ||
+                    Mirror.activeService()?.isLoggedIn() != true)
+                if (full) {
+                    LogStore.i(TAG, "Accounts changed (${entries.size} logged in) — full watch resync")
+                    pushConversations()
+                } else {
+                    reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                }
             } catch (e: Exception) {
                 LogStore.e(TAG, "refreshSwitcher failed", e)
             }

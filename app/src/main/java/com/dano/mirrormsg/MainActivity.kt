@@ -901,6 +901,7 @@ class MainActivity : Activity() {
             }
             revealAccounts(accWrap, accCard, on)   // slide out / back under
             pushConversationsToWatch()             // refresh the watch switcher
+            PebbleListenerService.instance?.refreshSwitcher()   // accounts changed
         }
         masterCard.addView(masterTxt, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -971,6 +972,7 @@ class MainActivity : Activity() {
                 }
                 renderHome()
                 pushConversationsToWatch()
+                PebbleListenerService.instance?.refreshSwitcher()   // accounts changed
                 true
             }
         }
@@ -2514,7 +2516,7 @@ class MainActivity : Activity() {
         // it gets the next logged-in account's list, or the empty roster (the
         // watch then drops its saved list and asks to log in on the phone).
         Mirror.dropCachedConvoLists(this, service.id)
-        PebbleListenerService.instance?.resyncAfterLogout()
+        PebbleListenerService.instance?.refreshSwitcher()
         // 2. Wipe WebView cookies so the next login starts fresh. (Both Google
         //    and Facebook log in via harvested WebView cookies, so this is
         //    shared cleanup — harmless for services that don't use it.)
