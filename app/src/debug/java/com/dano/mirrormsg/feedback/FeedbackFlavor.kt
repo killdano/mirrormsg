@@ -2,6 +2,7 @@ package com.dano.mirrormsg.feedback
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import com.dano.mirrormsg.LogStore
 import com.dano.mirrormsg.Vault
@@ -22,14 +23,28 @@ internal object FeedbackFlavor {
     private const val PREFS = "mirrormsg_feedback_code"
     private const val KEY_CODE = "owner_code"
 
-    fun open(activity: Activity) {
+    /** The Feedback screen's request code; its result is a home tab tapped there. */
+    private const val REQ_FEEDBACK = 9310
+
+    /**
+     * Opens the Feedback screen as the home screen's last tab: it draws [tabs]
+     * (the other tabs' labels, in order) with Feedback selected after them.
+     */
+    fun open(activity: Activity, tabs: List<String>) {
         try {
             init(activity)
-            MsgFeedback.open(activity)
+            MsgFeedback.open(activity, tabs, REQ_FEEDBACK)
         } catch (t: Throwable) {
             LogStore.e(TAG, "Feedback: couldn't open", t)
         }
     }
+
+    /**
+     * For the home screen's onActivityResult: the position in open's tabs of the
+     * tab tapped on the Feedback screen, or -1 (Back, or another screen's result).
+     */
+    fun tabChosen(requestCode: Int, resultCode: Int, data: Intent?): Int =
+        if (requestCode == REQ_FEEDBACK) MsgFeedback.tabChosen(resultCode, data) else -1
 
     /**
      * The owner code saved on the Feedback screen, or null. Read from the

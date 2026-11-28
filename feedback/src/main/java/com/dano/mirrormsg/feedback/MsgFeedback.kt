@@ -1,7 +1,9 @@
 package com.dano.mirrormsg.feedback
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
@@ -89,13 +91,36 @@ object MsgFeedback {
         this.host = host
     }
 
-    /** Opens the Feedback screen. */
-    fun open(context: Context) {
-        context.startActivity(
-            Intent(context, FeedbackActivity::class.java)
-                .addFlags(if (context is android.app.Activity) 0 else Intent.FLAG_ACTIVITY_NEW_TASK),
+    private const val EXTRA_TABS = "com.dano.mirrormsg.feedback.TABS"
+    private const val EXTRA_TAB = "com.dano.mirrormsg.feedback.TAB"
+
+    /**
+     * Opens the Feedback screen as the last tab of the app's home screen: it
+     * draws the home header and [tabs] (the other tabs' labels, in order) with
+     * Feedback selected after them. Tapping one of them closes it with that
+     * tab's position as the result ([tabChosen]). Neither way slides, so it
+     * looks like a tab switch.
+     */
+    fun open(activity: Activity, tabs: List<String>, requestCode: Int) {
+        activity.startActivityForResult(
+            Intent(activity, FeedbackActivity::class.java).putExtra(EXTRA_TABS, tabs.toTypedArray()),
+            requestCode,
         )
+        // From Android 14 the Feedback screen turns its own transitions off.
+        if (Build.VERSION.SDK_INT < 34) {
+            @Suppress("DEPRECATION")
+            activity.overridePendingTransition(0, 0)
+        }
     }
+
+    /** The position of the home tab tapped on the Feedback screen, or -1 (Back). */
+    fun tabChosen(resultCode: Int, data: Intent?): Int =
+        if (resultCode == Activity.RESULT_OK) data?.getIntExtra(EXTRA_TAB, -1) ?: -1 else -1
+
+    internal fun tabs(intent: Intent): List<String> =
+        intent.getStringArrayExtra(EXTRA_TABS)?.toList().orEmpty()
+
+    internal fun tabResult(position: Int): Intent = Intent().putExtra(EXTRA_TAB, position)
 
     /** Saves the owner code; blank clears it. */
     fun setOwnerCode(value: String?) {
