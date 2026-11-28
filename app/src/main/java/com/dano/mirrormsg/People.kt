@@ -35,6 +35,9 @@ internal object People {
     @Volatile var shown: List<Person> = emptyList()
     @Volatile var loadFailed: Boolean = false
 
+    /** The watch's list is the people screen (its level is the top of navStack). */
+    fun active(): Boolean = Mirror.navStack.lastOrNull() == CTX
+
     // ---- Matching (pure: unit-tested) ------------------------------------------------
 
     /** Lowercase, without accents ("Zoë" -> "zoe"). */
