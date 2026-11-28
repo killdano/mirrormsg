@@ -965,6 +965,39 @@ func recipientName(r *types.Recipient) string {
 	return ""
 }
 
+// ListPeople returns the people a new chat can start with (the watch's New chat):
+// the contacts the primary phone synced (and others the store has a name for), as
+// {"people":[{"id","name","detail"}]}. id is the 1:1 chat's id, the contact's ACI
+// (what SendMessage takes; the first send creates the chat, recordOwnSend).
+func (b *Bridge) ListPeople() (string, error) {
+	cli := b.currentClient()
+	if cli == nil || cli.Store == nil || cli.Store.RecipientStore == nil {
+		return "", fmt.Errorf("signal not connected")
+	}
+	all, err := cli.Store.RecipientStore.LoadAllContacts(b.ctx)
+	if err != nil {
+		return "", err
+	}
+	self := b.selfACI()
+	type person struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail,omitempty"`
+	}
+	out := make([]person, 0, len(all))
+	for _, r := range all {
+		if r == nil || r.ACI == uuid.Nil || r.ACI == self || r.Blocked {
+			continue
+		}
+		if r.ContactName == "" && r.Nickname == "" && r.Profile.Name == "" {
+			continue // a bare number, no one named
+		}
+		out = append(out, person{ID: r.ACI.String(), Name: recipientName(r), Detail: r.E164})
+	}
+	bs, _ := json.Marshal(map[string]any{"people": out})
+	return string(bs), nil
+}
+
 // ---- names -----------------------------------------------------------------
 
 func (b *Bridge) lookupName(key string) string {

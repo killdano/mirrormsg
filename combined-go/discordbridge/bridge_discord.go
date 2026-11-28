@@ -192,6 +192,9 @@ type Bridge struct {
 	// dmAvatar: a DM's photo (the other person's avatar, a group DM's icon) by
 	// channel id, as a CDN address (AvatarURL, step 90). No entry = none.
 	dmAvatar map[string]string
+	// The watch's New chat: READY's friends, and each person's 1:1 DM channel.
+	friends []dcFriend
+	dmWith  map[string]string // user id -> their 1:1 DM channel id
 
 	// Guilds: id -> name / icon, and each guild's text channels.
 	guildName    map[string]string
@@ -509,6 +512,7 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 	b.dmName = map[string]string{}
 	b.dmRecipient = map[string]string{}
 	b.dmAvatar = map[string]string{}
+	b.dmWith = map[string]string{}
 	b.dmOrder = b.dmOrder[:0]
 	// Order DMs / group-DMs most-recent-first by LastMessageID (a snowflake whose
 	// high bits encode a timestamp, so higher = newer). The phone renders
@@ -535,7 +539,35 @@ func (b *Bridge) onReady(r *discordgo.Ready) {
 		if u := dmAvatarURL(ch); u != "" {
 			b.dmAvatar[ch.ID] = u
 		}
+		if rid := primaryRecipient(ch); rid != "" && ch.Type == discordgo.ChannelTypeDM {
+			if _, had := b.dmWith[rid]; !had {
+				b.dmWith[rid] = ch.ID
+			}
+		}
 		b.dmOrder = append(b.dmOrder, ch.ID)
+	}
+	// Friends (READY's relationships, their names from READY's users), for New chat.
+	users := map[string]*discordgo.User{}
+	for _, u := range r.Users {
+		if u != nil {
+			users[u.ID] = u
+		}
+	}
+	b.friends = b.friends[:0]
+	for _, rel := range r.Relationships {
+		if rel == nil || rel.Type != discordgo.RelationshipFriend || rel.ID == "" {
+			continue
+		}
+		f := dcFriend{ID: rel.ID, Name: rel.Nickname}
+		if u := users[rel.ID]; u != nil {
+			if f.Name == "" {
+				f.Name = bestName(u)
+			}
+			f.Username = u.Username
+		}
+		if f.Name != "" {
+			b.friends = append(b.friends, f)
+		}
 	}
 	b.guildName = map[string]string{}
 	b.guildIcon = map[string]string{}
@@ -1044,6 +1076,82 @@ func (b *Bridge) SendMessage(conversationID, text string) string {
 		id = msg.ID
 	}
 	bs, _ := json.Marshal(map[string]interface{}{"ok": true, "messageID": id})
+	return string(bs)
+}
+
+// dcFriend: one of READY's friends, for the watch's New chat.
+type dcFriend struct {
+	ID       string
+	Name     string
+	Username string
+}
+
+// ListPeople returns the people a new chat can start with (the watch's New chat):
+// the account's friends, as {"people":[{"id","name","detail","chat"}]}. id is the
+// user id OpenPerson takes; chat names their 1:1 DM when there is one.
+func (b *Bridge) ListPeople() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	type person struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail,omitempty"`
+		Chat   string `json:"chat,omitempty"`
+	}
+	out := make([]person, 0, len(b.friends))
+	for _, f := range b.friends {
+		p := person{ID: f.ID, Name: f.Name}
+		if f.Username != "" {
+			p.Detail = "@" + f.Username
+		}
+		if ch := b.dmWith[f.ID]; ch != "" {
+			p.Chat = convoIDPrefix + ch
+		}
+		out = append(out, p)
+	}
+	bs, _ := json.Marshal(map[string]any{"people": out})
+	return string(bs)
+}
+
+// OpenPerson returns the 1:1 DM with user userID as {"conversationID","name"}: the one
+// there is, else one made now (UserChannelCreate), listed from then on.
+func (b *Bridge) OpenPerson(userID string) string {
+	b.mu.Lock()
+	s := b.session
+	ch := b.dmWith[userID]
+	name := b.dmName[ch]
+	b.mu.Unlock()
+	if ch == "" {
+		if s == nil {
+			return b.fail("not started")
+		}
+		c, err := s.UserChannelCreate(userID)
+		if err != nil {
+			return b.fail(err.Error())
+		}
+		if c == nil || c.ID == "" {
+			return b.fail("no DM channel")
+		}
+		ch = c.ID
+		b.mu.Lock()
+		if _, had := b.dmName[ch]; !had {
+			b.dmName[ch] = dmDisplayName(c)
+			if rid := primaryRecipient(c); rid != "" {
+				b.dmRecipient[ch] = rid
+			}
+			if u := dmAvatarURL(c); u != "" {
+				b.dmAvatar[ch] = u
+			}
+			b.dmOrder = append([]string{ch}, b.dmOrder...)
+		}
+		if b.dmWith == nil {
+			b.dmWith = map[string]string{}
+		}
+		b.dmWith[userID] = ch
+		name = b.dmName[ch]
+		b.mu.Unlock()
+	}
+	bs, _ := json.Marshal(map[string]string{"conversationID": convoIDPrefix + ch, "name": name})
 	return string(bs)
 }
 

@@ -267,6 +267,17 @@ class WhatsAppService : MessagingService, ReactionRemover {
         return resp
     }
 
+    // ---- New chat (People.kt) -------------------------------------------------
+    // The address-book contacts WhatsApp synced. A person's id is their chat's JID, so
+    // their chat is that id (the first send makes it on WhatsApp).
+    override val supportsNewChat = true
+
+    override fun listPeople(): String =
+        ensureBridge()?.listPeople() ?: "{\"people\":[]}"
+
+    override fun openPerson(personId: String): String =
+        org.json.JSONObject().put("conversationID", personId).toString()
+
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         // conversationId IS the chat JID. The send returns {"messageId":...};
         // a hard failure throws.

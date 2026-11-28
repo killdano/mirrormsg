@@ -194,6 +194,21 @@ class GoogleMessagesService : MessagingService, ReactionRemover {
         return resp
     }
 
+    // ---- New chat (People.kt) -------------------------------------------------
+    // The contacts as Messages for web lists them, the top ones first; picking one gets
+    // the conversation with their number (Google Messages makes one if there's none).
+    override val supportsNewChat = true
+
+    override fun listPeople(): String = Mirror.bridge?.listPeople() ?: "{\"people\":[]}"
+
+    override fun openPerson(personId: String): String =
+        try {
+            Mirror.bridge?.openPerson(personId) ?: ""
+        } catch (e: Throwable) {
+            LogStore.e("GoogleMessagesService", "openPerson failed", e)
+            ""
+        }
+
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         val route = decodeRoute(replyToken)
         return Mirror.bridge?.sendMessage(

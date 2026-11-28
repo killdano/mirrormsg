@@ -224,6 +224,17 @@ class SignalService : MessagingService, ReactionRemover {
         return resp
     }
 
+    // ---- New chat (People.kt) -------------------------------------------------
+    // The contacts synced from the primary phone. A person's id is their 1:1 chat's
+    // (their ACI); the first send makes the chat.
+    override val supportsNewChat = true
+
+    override fun listPeople(): String =
+        ensureBridge()?.listPeople() ?: "{\"people\":[]}"
+
+    override fun openPerson(personId: String): String =
+        org.json.JSONObject().put("conversationID", personId).toString()
+
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String =
         try {
             // The bridge indexes + emits our own send as a MESSAGE event, so the

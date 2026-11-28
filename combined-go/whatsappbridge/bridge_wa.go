@@ -1615,6 +1615,56 @@ func (b *Bridge) SendMessage(convoID, text string) (string, error) {
 	return string(out), nil
 }
 
+// ListPeople returns the people a new chat can start with (the watch's New chat):
+// the contacts saved in the phone's address book that WhatsApp synced, as
+// {"people":[{"id","name","detail"}]}. id is the 1:1 chat's JID, the key
+// ListConversations and SendMessage use (a LID contact resolved to its phone JID);
+// a first send to it creates the chat.
+func (b *Bridge) ListPeople() (string, error) {
+	if b.client == nil || b.client.Store == nil || b.client.Store.Contacts == nil {
+		return "", fmt.Errorf("whatsapp not connected")
+	}
+	all, err := b.client.Store.Contacts.GetAllContacts(b.ctx)
+	if err != nil {
+		return "", err
+	}
+	type person struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail,omitempty"`
+	}
+	own := ""
+	if b.client.Store.ID != nil {
+		own = b.client.Store.ID.User
+	}
+	seen := map[string]bool{}
+	out := make([]person, 0, len(all))
+	for jid, ci := range all {
+		if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+			continue
+		}
+		c := b.canonicalChatJID(jid.ToNonAD())
+		if c.Server != types.DefaultUserServer || c.User == "" || c.User == own {
+			continue
+		}
+		name := ci.FullName
+		if name == "" {
+			name = ci.FirstName
+		}
+		if name == "" {
+			continue // not in the address book: not a contact
+		}
+		key := c.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, person{ID: key, Name: name, Detail: "+" + c.User})
+	}
+	bs, _ := json.Marshal(map[string]any{"people": out})
+	return string(bs), nil
+}
+
 // quotedFor resolves the sender JID and text of the message being replied-to or
 // reacted-to, from the bridge's stored history for convoID. The sender is our own
 // JID when the quoted message is ours (so the key/context mark it FromMe), the
