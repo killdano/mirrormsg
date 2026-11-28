@@ -111,8 +111,9 @@ replace github.com/bwmarrin/discordgo => github.com/beeper/discordgo v0.0.0-2026
 replace go.mau.fi/mautrix-meta => ../third_party/mautrix-meta
 
 // Google Messages: mautrix-gmessages v0.2605.0 with the Sept 2026 Google-account
-// pairing field backported. See third_party/mautrix-gmessages/MIRRORMSG-PATCH.md.
-// Remove when upgrading mautrix-gmessages to v0.2609.0 or later.
+// pairing field and v0.2611.0's new-format id fill backported. See
+// third_party/mautrix-gmessages/MIRRORMSG-PATCH.md.
+// Remove when upgrading mautrix-gmessages to v0.2611.0 or later.
 replace go.mau.fi/mautrix-gmessages => ../third_party/mautrix-gmessages
 
 replace go.mau.fi/whatsmeow => ./third_party/whatsmeow
