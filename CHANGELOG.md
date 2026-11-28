@@ -13,3 +13,4 @@
 - Start a new chat from the watch with someone on Google Messages, WhatsApp, Telegram, Signal or Discord: New chat at the top of the watch's account switcher lists your contacts, and saying or typing part of a name finds them.
 - The Emoji substitution setting shows only for the Pebble Time and Time Steel. The Time 2 shows every emoji as sent.
 - Google Messages pairing no longer stops with "Pairing didn't finish" right after the emoji appears.
+- Image quality is now one setting, from Faster to Sharper. Tall pictures no longer come out squashed.

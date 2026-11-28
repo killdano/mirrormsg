@@ -871,49 +871,16 @@ class MainActivity : Activity() {
         c.addView(setCard)
 
         // ---- IMAGE QUALITY ------------------------------------------------
+        // One setting (Mirror.imgQuality): the stop sets every encoder dial.
         sectionLabel(c, p, "Image quality")
         val iqCard = card(p)
-        // Animate adds/removes inside this card so the compressibility dial slides
-        // in and the rows below it push down smoothly, instead of snapping.
-        iqCard.layoutTransition = android.animation.LayoutTransition().apply {
-            enableTransitionType(android.animation.LayoutTransition.CHANGING)
+        addStopSliderRow(iqCard, p, "Pictures", Mirror.IMG_QUALITY_NAMES, listOf(
+                "Plain colors: pictures arrive quicker, skies show bands",
+                "Smooth gradients",
+                "Smooth gradients, and previews keep every color"),
+            Mirror.imgQuality, "faster  \u2190          \u2192  sharper") { q ->
+            Mirror.setImgQuality(this, q)
         }
-        iqCard.addView(TextView(this).apply {
-            text = "Images use as many colors as they need, up to a limit. " +
-                "The sliders decide how readily a busy image settles for fewer " +
-                "colors — lower = fewer colors more often (smaller, faster), " +
-                "higher = keep more colors."
-            textSize = 13f; setTextColor(p.subtext)
-            setPadding(0, dp(2), 0, dp(10))
-        })
-        addColorCapRow(iqCard, p, "Thumbnail color limit",
-            "Max colors for chat-view previews.", Mirror.imgThumbCap) { colors ->
-            Mirror.setImgThumbCap(this, colors)
-        }
-        addDivider(iqCard, p)
-        addCoverageSliderRow(iqCard, p, "Thumbnail colors",
-            Mirror.imgThumbCoverage) { pct -> Mirror.setImgThumbCoverage(this, pct) }
-        addDivider(iqCard, p)
-        addColorCapRow(iqCard, p, "Full-size color limit",
-            "Max colors for the opened image.", Mirror.imgFullCap) { colors ->
-            Mirror.setImgFullCap(this, colors)
-        }
-        addDivider(iqCard, p)
-        addCoverageSliderRow(iqCard, p, "Full-size colors",
-            Mirror.imgFullCoverage) { pct -> Mirror.setImgFullCoverage(this, pct) }
-        addDivider(iqCard, p)
-        addToggleRow(iqCard, p, "Compress large images",
-            "Keep full-size images compressed in watch memory so bigger images fit.",
-            Mirror.imgCompress) { on ->
-            Mirror.setImgCompress(this, on)
-            // Show/hide the compressibility dial IN PLACE — same approach as the
-            // Beeper master switch. Re-rendering the tab instead made the whole
-            // settings list flicker and jump the scroll position.
-            compressDitherRow?.visibility =
-                if (on) android.view.View.VISIBLE else android.view.View.GONE
-        }
-        addDivider(iqCard, p)
-        addDitherSection(iqCard, p)
         c.addView(iqCard)
 
         // ---- TEST BUILDS --------------------------------------------------
@@ -967,60 +934,13 @@ class MainActivity : Activity() {
         parent.addView(row)
     }
 
-    // Dithering: a switch that reveals three sliders (edge protection, strength,
-    // intensity). Simulates more colours on smooth gradients by blending palette
-    // colours, at a compression cost — so it's opt-in. The sliders are disabled
-    // (greyed) until the switch is on.
-    // The compressibility dial, held so the compression switch can show/hide it in
-    // place. Rebuilt on each render of the settings tab; cleared implicitly when
-    // that tab is rebuilt, and only ever touched from the compression switch's
-    // listener while the same tab is on screen.
-    private var compressDitherRow: android.view.View? = null
-
-    private fun addDitherSection(parent: LinearLayout, p: Palette) {
-        val sliders = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        fun setEnabled(on: Boolean) {
-            sliders.alpha = if (on) 1f else 0.4f
-            fun walk(v: android.view.View) {
-                v.isEnabled = on
-                if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
-            }
-            walk(sliders)
-        }
-        addToggleRow(parent, p, "Dither gradients",
-            "Blend palette colors to smooth gradients and simulate more colors. " +
-            "Flat areas and hard edges stay crisp.",
-            Mirror.imgDither) { on -> Mirror.setImgDither(this, on); setEnabled(on) }
-        // Only meaningful alongside compression: this dial trades dithering away to
-        // keep long runs of identical pixels intact for the compressor. With
-        // compression off there is nothing to preserve, so the encoder dithers the
-        // whole image and the dial is hidden rather than shown doing nothing.
-        // It's built ALWAYS and kept in the layout with its visibility toggled, so
-        // the compression switch reveals it in place (no re-render, no flicker,
-        // no scroll jump) — the same technique the Beeper master switch uses.
-        val compressRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        addSliderRow(compressRow, p, "Keep images compressible",
-            "Leaves flat areas and hard edges undithered so images compress smaller. " +
-            "Lower means smoother gradients but larger transfers.",
-            Mirror.imgDitherCompress,
-            "smoother  \u2190          \u2192  smaller") { v -> Mirror.setImgDitherCompress(this, v) }
-        compressRow.visibility =
-            if (Mirror.imgCompress) android.view.View.VISIBLE else android.view.View.GONE
-        compressDitherRow = compressRow
-        sliders.addView(compressRow)
-        addSliderRow(sliders, p, "Dither strength",
-            "Higher = stronger texture; lower = softer and more compressible.",
-            Mirror.imgDitherIntensity,
-            "lite  \u2190          \u2192  strong") { v -> Mirror.setImgDitherIntensity(this, v) }
-        parent.addView(sliders)
-        setEnabled(Mirror.imgDither)
-    }
-
-    // Generic 0-100 slider row with a caption. Value label updates live; onChange
-    // fires on release.
-    private fun addSliderRow(parent: LinearLayout, p: Palette, title: String,
-                             sub: String, current: Int, caption: String,
-                             onChange: (Int) -> Unit) {
+    // A slider with a few named stops: the title, a line saying what the current
+    // stop does, the stop's name on the right, and a caption under the bar. The
+    // line and the name follow the thumb live; onChange fires on release.
+    private fun addStopSliderRow(parent: LinearLayout, p: Palette, title: String,
+                                 names: List<String>, lines: List<String>, current: Int,
+                                 caption: String, onChange: (Int) -> Unit) {
+        val last = names.size - 1
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, dp(8))
@@ -1033,26 +953,32 @@ class MainActivity : Activity() {
         titles.addView(TextView(this).apply {
             text = title; textSize = 16f; setTextColor(p.text)
         })
-        titles.addView(TextView(this).apply {
-            text = sub; textSize = 13f; setTextColor(p.subtext)
-        })
+        val start = current.coerceIn(0, last)
+        val line = TextView(this).apply {
+            text = lines[start]; textSize = 13f; setTextColor(p.subtext)
+        }
+        titles.addView(line)
         header.addView(titles, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val valueLabel = TextView(this).apply {
-            text = "$current"; textSize = 14f; setTextColor(p.subtext)
+            text = names[start]; textSize = 14f; setTextColor(p.subtext)
         }
         header.addView(valueLabel)
         col.addView(header)
+        var shown = start
         val seek = android.widget.SeekBar(this).apply {
-            max = 100
-            progress = current.coerceIn(0, 100)
+            max = last
+            progress = start
             setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
-                    valueLabel.text = "$prog"
+                    val k = prog.coerceIn(0, last)
+                    valueLabel.text = names[k]
+                    line.text = lines[k]
                 }
                 override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
                 override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
-                    onChange(sb?.progress ?: 0)
+                    val k = (sb?.progress ?: shown).coerceIn(0, last)
+                    if (k != shown) { shown = k; onChange(k) }
                 }
             })
         }
@@ -1846,48 +1772,6 @@ class MainActivity : Activity() {
         return subView
     }
 
-    // ---- Image quality helper rows ----------------------------------------
-    // Colour-cap picker: a small spinner of 2 / 4 / 16 (the three watch-supported
-    // palette sizes). onPick gets the chosen colour COUNT.
-    private fun addColorCapRow(parent: LinearLayout, p: Palette, title: String,
-                               subtitle: String, current: Int, onPick: (Int) -> Unit) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        txt.addView(TextView(this).apply {
-            text = title; textSize = 16f; setTextColor(p.text)
-        })
-        txt.addView(TextView(this).apply {
-            text = subtitle; textSize = 13f; setTextColor(p.subtext)
-        })
-        val options = listOf(2, 4, 16)
-        val spinner = android.widget.Spinner(this).apply {
-            adapter = android.widget.ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                options.map { "$it colors" }).apply {
-                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-            }
-            setSelection(options.indexOf(current).coerceAtLeast(0))
-            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: android.widget.AdapterView<*>?,
-                                            view: android.view.View?, pos: Int, id: Long) {
-                    val picked = options[pos]
-                    if (picked != current) onPick(picked)
-                }
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-            }
-        }
-        row.addView(txt, LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(spinner, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        parent.addView(row)
-    }
-
     // A setting with a few named choices: title and subtitle, and a dropdown on the right.
     // Returns a setter that shows another choice without calling onPick (the setting
     // changed elsewhere).
@@ -1929,50 +1813,6 @@ class MainActivity : Activity() {
             val c = v.coerceIn(0, labels.size - 1)
             if (c != shown) { shown = c; spinner.setSelection(c) }
         }
-    }
-
-    // Coverage slider: a SeekBar mapped to 10-100% with a live "fewer <-> more
-    // colours" caption and the current percent. onChange fires on release.
-    private fun addCoverageSliderRow(parent: LinearLayout, p: Palette, title: String,
-                                     currentPct: Int, onChange: (Int) -> Unit) {
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        header.addView(TextView(this).apply {
-            text = title; textSize = 16f; setTextColor(p.text)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val valueLabel = TextView(this).apply {
-            text = "$currentPct%"; textSize = 14f; setTextColor(p.subtext)
-        }
-        header.addView(valueLabel, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        col.addView(header)
-        val seek = android.widget.SeekBar(this).apply {
-            max = 90                       // 0..90 maps to 10..100%
-            progress = (currentPct - 10).coerceIn(0, 90)
-            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: android.widget.SeekBar?, prog: Int, fromUser: Boolean) {
-                    valueLabel.text = "${prog + 10}%"
-                }
-                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
-                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
-                    onChange((sb?.progress ?: 0) + 10)
-                }
-            })
-        }
-        col.addView(seek, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        val caption = TextView(this).apply {
-            text = "fewer colors  \u2190          \u2192  more colors"
-            textSize = 11f; setTextColor(p.subtext)
-        }
-        col.addView(caption)
-        parent.addView(col)
     }
 
     /**

@@ -420,70 +420,67 @@ object Mirror {
     // Wire key/type unchanged (KEY_HEAP_GUARD, int bytes). Default 800 B.
     @Volatile var heapGuard: Int = 800
 
-    // ---- Image quality dials (phone-side encoder config) ------------------
-    // Colour caps are a COUNT (2/4/16) = the max palette size the encoder may use
-    // for that path; the detector picks the smallest depth that still looks right
-    // UP TO this cap. Coverages are an int percent (10-100) = how much of the image
-    // (by colour area) the significant-colour count must cover before the rarest
-    // colours are dropped — LOWER = complex images settle for fewer colours more
-    // often (smaller files), HIGHER = keep more colours. Pushed into the Go encoder
-    // via Watchimage.setConfig at startup and on change. Defaults match the encoder.
-    // Both image types get the full 16-colour ceiling. Thumbnails were capped at
-    // 4 to keep the churny, dynamically-allocated previews cheap; with the
-    // coverage figures below the analyzer still drops simple thumbnails to a
-    // lower depth on its own, so the cap no longer has to do that job bluntly.
-    // (A 16-colour thumbnail costs w*h/2 bytes of watch heap instead of w*h/4 —
-    // the analyzer keeps that from being the common case.)
-    @Volatile var imgThumbCap: Int = 16      // colours: 2/4/16
-    @Volatile var imgFullCap: Int = 16       // colours: 2/4/16
-    // Coverage = the share of pixel AREA the "significant colour" count must
-    // explain. Higher means rare colours still count, so the analyzer picks a
-    // higher depth. 94% for the full view keeps photographic detail; 72% for
-    // thumbnails lets genuinely simple previews fall to a cheaper depth.
-    @Volatile var imgThumbCoverage: Int = 72 // percent 10-100
-    @Volatile var imgFullCoverage: Int = 94  // percent 10-100
+    // ---- Image quality: one setting, "Pictures" ----------------------------
+    // Settings > Image quality has one slider with three stops. Each sets every
+    // encoder dial in pushImageConfig; nothing else is a user setting any more:
+    // how many colours a picture uses (2/4/16), its size (from the room the watch
+    // reports) and whether it goes compressed or plain are picked per picture.
+    //   Faster:   no dithering (pictures, GIFs, video), previews use at most 4
+    //             colours. Smaller transfers; skies and shadows show bands.
+    //   Balanced: the old defaults (16 colours, 72% / 94% coverage, dithered).
+    //   Sharper:  as Balanced, but previews and opened pictures keep every colour
+    //             (100% coverage), so screenshot previews aren't cut to 2.
+    // Compression of the opened picture is always on: the phone sends whichever of
+    // compressed or plain is smaller, so it's never worse than off.
+    const val IMG_FASTER = 0
+    const val IMG_BALANCED = 1
+    const val IMG_SHARPER = 2
+    val IMG_QUALITY_NAMES = listOf("Faster", "Balanced", "Sharper")
+    @Volatile var imgQuality: Int = IMG_BALANCED
 
-    // Phase 2: heap-saving row compression on the full-size (enhanced) view only.
-    // The watch keeps the image compressed in RAM and expands one scanline at a time
-    // into the framebuffer, so a large image costs its compressed size in heap, not
-    // its decoded size. Enhanced-view ONLY by design: thumbnails are tiny, cached as
-    // decoded bitmaps, and redraw every scroll frame — decode-on-draw there would
-    // spend CPU per frame to save a few hundred bytes and add resident decoder code,
-    // a net loss (that's why there's no "compress thumbnails" option). Opt-in; the
-    // phone ships raw when an image doesn't compress, so it's never worse than off.
-    @Volatile var imgCompress: Boolean = true
+    // The eight settings "Pictures" replaced (the first start after the update
+    // carries them over once, then deletes them; see imgQualityFromOld).
+    private val OLD_IMG_KEYS = listOf("imgThumbCap", "imgFullCap", "imgThumbCoverage",
+        "imgFullCoverage", "imgCompress", "imgDither", "imgDitherEdge", "imgDitherStrength",
+        "imgDitherCompress", "imgDitherIntensity")
 
-    // Adaptive dithering (opt-in). Reconstructs smooth gradients against the chosen
-    // palette so few-colour images look like they have more colours, at a
-    // compression cost — that's why it's opt-in. Flat fills and hard edges are left
-    // crisp. Three dials: edge protection (keep boundaries sharp), strength (how
-    // readily a region counts as a ditherable gradient), intensity (how strong the
-    // dither texture is — lower = softer, cleaner, more compressible). The slider
-    // UI shows friendly 0-100 values; these are mapped to the encoder's internal
-    // squared-distance thresholds in pushImageConfig.
-    // ON by default. Without error diffusion a 16-colour palette shows hard
-    // banding on any photographic gradient (measured: ~28x worse perceptual
-    // error than whole-image dithering on a real dark photo).
-    @Volatile var imgDither: Boolean = true
-    // Compression bias: how much of the image is EXCLUDED from dithering to keep
-    // it row-compressible. 0 = dither every pixel (smoothest gradients, largest
-    // transfers); higher = protect more flat regions and hard edges, so long runs
-    // of identical pixels survive for the compressor.
-    //
-    // This single dial replaced three controls ("edge protection", "dither
-    // strength", and a "dither entire image" switch) that were really one idea
-    // wearing three hats — and whose interaction hid a cliff: the strength slider
-    // only disabled edge protection at exactly 100, so 99 and 100 ran visibly
-    // different algorithms. It drives both encoder thresholds together, so the
-    // range is continuous end to end.
-    //
-    // Only meaningful when imgCompress is on; with compression off there is
-    // nothing to preserve, so the encoder always dithers the whole image and the
-    // UI hides this control entirely.
-    @Volatile var imgDitherCompress: Int = 0      // 0-100 UI (compression bias)
-    @Volatile var imgDitherEdge: Int = 50         // legacy, no longer surfaced in the UI
-    @Volatile var imgDitherStrength: Int = 100     // legacy, no longer surfaced in the UI
-    @Volatile var imgDitherIntensity: Int = 100    // 0-100 UI (diffusion strength)
+    /**
+     * The "Pictures" stop closest to the old Image quality settings (their old
+     * defaults give Balanced). Faster when any of them already meant "smaller and
+     * plainer": dithering off, dither strength below 50, "Keep images compressible"
+     * above 0 with compression on, or a colour limit below 16. Otherwise Sharper
+     * when either colours slider was raised above its default. Otherwise Balanced.
+     */
+    internal fun imgQualityFromOld(thumbCap: Int, fullCap: Int, thumbCoverage: Int,
+                                   fullCoverage: Int, compress: Boolean, dither: Boolean,
+                                   ditherCompress: Int, ditherIntensity: Int): Int = when {
+        !dither -> IMG_FASTER
+        ditherIntensity < 50 -> IMG_FASTER
+        compress && ditherCompress > 0 -> IMG_FASTER
+        thumbCap == 2 || thumbCap == 4 || fullCap == 2 || fullCap == 4 -> IMG_FASTER
+        thumbCoverage > 72 || fullCoverage > 94 -> IMG_SHARPER
+        else -> IMG_BALANCED
+    }
+
+    private fun loadImgQuality(prefs: android.content.SharedPreferences): Int {
+        if (prefs.contains("imgQuality")) {
+            return prefs.getInt("imgQuality", IMG_BALANCED).coerceIn(IMG_FASTER, IMG_SHARPER)
+        }
+        // First start since the update: carry the old settings over, once.
+        val q = imgQualityFromOld(
+            prefs.getInt("imgThumbCap", 16),
+            prefs.getInt("imgFullCap", 16),
+            prefs.getInt("imgThumbCoverage", 72).coerceIn(10, 100),
+            prefs.getInt("imgFullCoverage", 94).coerceIn(10, 100),
+            prefs.getBoolean("imgCompress", true),
+            prefs.getBoolean("imgDither", true),
+            prefs.getInt("imgDitherCompress", 0).coerceIn(0, 100),
+            prefs.getInt("imgDitherIntensity", 100).coerceIn(0, 100))
+        val ed = prefs.edit().putInt("imgQuality", q)
+        OLD_IMG_KEYS.forEach { ed.remove(it) }
+        ed.apply()
+        return q
+    }
 
     fun loadSettings(ctx: Context) {
         val prefs = ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
@@ -503,19 +500,7 @@ object Mirror {
         hybridIanWhenOpen = prefs.getBoolean("hybridIanWhenOpen", false)
         thumbLimit = prefs.getInt("thumbLimit", 4).coerceIn(0, 8)
         heapGuard = prefs.getInt("heapGuard", 800)
-        imgThumbCap = prefs.getInt("imgThumbCap", 16)
-        imgFullCap = prefs.getInt("imgFullCap", 16)
-        imgThumbCoverage = prefs.getInt("imgThumbCoverage", 72).coerceIn(10, 100)
-        imgFullCoverage = prefs.getInt("imgFullCoverage", 94).coerceIn(10, 100)
-        // Compression ON by default: dithered photos row-compress poorly, but
-        // flat/graphic images compress hard, and the encoder ships whichever of
-        // raw/compressed is smaller — so this is never worse than off.
-        imgCompress = prefs.getBoolean("imgCompress", true)
-        imgDither = prefs.getBoolean("imgDither", true)
-        imgDitherEdge = prefs.getInt("imgDitherEdge", 50).coerceIn(0, 100)
-        imgDitherStrength = prefs.getInt("imgDitherStrength", 100).coerceIn(0, 100)
-        imgDitherCompress = prefs.getInt("imgDitherCompress", 0).coerceIn(0, 100)
-        imgDitherIntensity = prefs.getInt("imgDitherIntensity", 100).coerceIn(0, 100)
+        imgQuality = loadImgQuality(prefs)
         pushImageConfig()
         accountNumber = prefs.getString("accountNumber", "") ?: ""
         _activeServiceId = prefs.getString("activeServiceId", "google") ?: "google"
@@ -530,100 +515,34 @@ object Mirror {
             .edit().putInt("thumbLimit", thumbLimit).apply()
     }
 
-    // ---- Image quality setters --------------------------------------------
-    // Each persists and immediately re-pushes the full config to the encoder so a
-    // dial change applies to the very next image (no restart). Caps clamp to the
-    // three watch-supported palette sizes; coverages to 10-100%.
-    private fun persistInt(ctx: Context, key: String, v: Int) {
+    /** Settings > Image quality > Pictures. Applies to the very next picture (no restart). */
+    fun setImgQuality(ctx: Context, q: Int) {
+        imgQuality = q.coerceIn(IMG_FASTER, IMG_SHARPER)
         ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt(key, v).apply()
-    }
-
-    fun setImgThumbCap(ctx: Context, colors: Int) {
-        imgThumbCap = if (colors == 2 || colors == 4 || colors == 16) colors else 16
-        persistInt(ctx, "imgThumbCap", imgThumbCap); pushImageConfig()
-    }
-
-    fun setImgFullCap(ctx: Context, colors: Int) {
-        imgFullCap = if (colors == 2 || colors == 4 || colors == 16) colors else 16
-        persistInt(ctx, "imgFullCap", imgFullCap); pushImageConfig()
-    }
-
-    fun setImgThumbCoverage(ctx: Context, percent: Int) {
-        imgThumbCoverage = percent.coerceIn(10, 100)
-        persistInt(ctx, "imgThumbCoverage", imgThumbCoverage); pushImageConfig()
-    }
-
-    fun setImgFullCoverage(ctx: Context, percent: Int) {
-        imgFullCoverage = percent.coerceIn(10, 100)
-        persistInt(ctx, "imgFullCoverage", imgFullCoverage); pushImageConfig()
-    }
-
-    fun setImgCompress(ctx: Context, on: Boolean) {
-        imgCompress = on
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putBoolean("imgCompress", on).apply()
-        pushImageConfig() // CompressFit sizing follows this toggle in the encoder
-    }
-
-    fun setImgDither(ctx: Context, on: Boolean) {
-        imgDither = on
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putBoolean("imgDither", on).apply()
+            .edit().putInt("imgQuality", imgQuality).apply()
         pushImageConfig()
     }
 
-    fun setImgDitherEdge(ctx: Context, v: Int) {
-        imgDitherEdge = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherEdge", imgDitherEdge).apply()
-        pushImageConfig()
-    }
-
-    fun setImgDitherStrength(ctx: Context, v: Int) {
-        imgDitherStrength = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherStrength", imgDitherStrength).apply()
-        pushImageConfig()
-    }
-
-    fun setImgDitherCompress(ctx: Context, v: Int) {
-        imgDitherCompress = v.coerceIn(0, 100)
-        persistInt(ctx, "imgDitherCompress", imgDitherCompress); pushImageConfig()
-    }
-
-    fun setImgDitherIntensity(ctx: Context, v: Int) {
-        imgDitherIntensity = v.coerceIn(0, 100)
-        ctx.getSharedPreferences("mirrormsg", Context.MODE_PRIVATE)
-            .edit().putInt("imgDitherIntensity", imgDitherIntensity).apply()
-        pushImageConfig()
-    }
-
-    // Push the four dials into the Go encoder. Coverage percent -> fraction. Safe
-    // to call anytime; the Go side clamps anything out of range to its defaults.
+    // Push the encoder dials for the current stop into the Go encoder. Safe to call
+    // anytime; the Go side clamps anything out of range to its defaults. The GIF
+    // and video encoders read the colour caps and the dither switch from here too.
     fun pushImageConfig() {
+        val faster = imgQuality == IMG_FASTER
+        val sharper = imgQuality == IMG_SHARPER
         try {
-            // One dial -> both encoder thresholds, scaled together so the range is
-            // continuous (no magic value, no cliff).
-            //   gradient threshold: 0 at bias 0 (every pixel dithers) up to 3000
-            //     (only strong gradients dither, flat areas left solid).
-            //   edge threshold: a concentrated jump >= this counts as an edge and
-            //     is kept crisp AND excluded from diffusion. Huge at bias 0 so
-            //     nothing qualifies; tight at bias 100 so edges are protected.
-            // Compression off => nothing to preserve => always dither everything.
-            val bias = if (imgCompress) imgDitherCompress else 0
-            val gradThresh = (bias * 30).coerceIn(0, 3000)
-            val edgeThresh = (110000 - bias * 1000).coerceIn(10000, 110000)
             fi.mirrormsg.mirrorbridge.Mirrorbridge.setImageConfig(
-                imgThumbCoverage / 100.0,
-                imgFullCoverage / 100.0,
-                imgThumbCap.toLong(),
-                imgFullCap.toLong(),
-                imgCompress,
-                imgDither,
-                edgeThresh.toLong(),
-                gradThresh.toLong(),
-                imgDitherIntensity.toLong(),
+                if (sharper) 1.0 else 0.72,       // preview coverage
+                if (sharper) 1.0 else 0.94,       // opened-picture coverage
+                if (faster) 4L else 16L,          // preview colour cap
+                16L,                              // opened-picture colour cap
+                true,                             // size opened pictures for compression
+                !faster,                          // dither
+                // Dither every pixel that needs it: no edge or flat-area exclusion
+                // (what the old "Keep images compressible" did at 0), at full
+                // strength (the old "Dither strength" at 100).
+                110000L,                          // edge threshold
+                0L,                               // gradient threshold
+                100L,                             // dither intensity
             )
         } catch (e: Throwable) {
             // Encoder not loaded yet / older AAR without setImageConfig — harmless,
