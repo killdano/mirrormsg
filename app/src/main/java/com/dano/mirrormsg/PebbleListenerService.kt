@@ -4618,12 +4618,14 @@ class PebbleListenerService : BasePebbleListenerService() {
             // the active account a REAL logged-in one (the persisted id — or the
             // "google" default — may name a wiped account), so we never boot the
             // watch into a dead account with an empty list and broken nav.
-            Mirror.ensureActiveLoggedIn(this)
-            val svc = Mirror.activeService() ?: run {
-                // Nothing logged in (e.g. right after a full wipe). Still send the
-                // authoritative (empty) roster so the watch discards its stale
-                // account list instead of showing accounts that no longer exist.
-                LogStore.w(TAG, "No service for auto-push — reporting empty roster")
+            // Use what ensureActiveLoggedIn resolved, not Mirror.activeService():
+            // with nothing logged in, activeService() still names the logged-out
+            // account, and its cached list used to stream to the watch.
+            val svc = Mirror.ensureActiveLoggedIn(this) ?: run {
+                // Nothing logged in (a logout, or right after a full wipe). Send
+                // only the authoritative (empty) roster: the watch drops its saved
+                // list and asks the user to log in on the phone. No list follows.
+                LogStore.w(TAG, "Nothing logged in — reporting empty roster, no list")
                 reportServiceList()
                 return
             }
@@ -4818,11 +4820,15 @@ class PebbleListenerService : BasePebbleListenerService() {
      *
      * Safe to call liberally (e.g. every poll cycle) — the signature diff drops
      * no-op calls so it won't spam the watch. Runs on the service scope, needs no
-     * Activity: call via PebbleListenerService.instance?.refreshSwitcher().
+     * Activity: call via PebbleListenerService.instance?.refreshSwitcher(). Also
+     * called on a logout and when a Beeper account (or Beeper itself) is switched
+     * off or on.
      *
-     * Note: like reportServiceList(), this only pushes a rail for 2+ logged-in
-     * accounts; a drop to a single account doesn't actively collapse an already-
-     * shown rail (pre-existing behaviour of the 2+ gate, unchanged here).
+     * With the watchapp open, a change that leaves nothing logged in, brings the
+     * first account back, or takes away the active account re-syncs the watch in
+     * full (pushConversations: the roster and the active account's list, or only
+     * the empty roster, which makes the watch drop its list and ask to log in).
+     * Any other change re-sends only the rail, so the watch keeps its place.
      */
     fun refreshSwitcher() {
         scope.launch {
@@ -4832,7 +4838,15 @@ class PebbleListenerService : BasePebbleListenerService() {
                           "|" + Mirror.activeServiceId + "|" + Mirror.activeTgFolder + "|" + Mirror.activeDiscordGuild
                 if (sig == lastSwitcherSig) return@launch
                 lastSwitcherSig = sig
-                reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                val full = Mirror.watchAppOpen && (entries.isEmpty() ||
+                    Mirror.lastSwitcherEntries.isEmpty() ||
+                    Mirror.activeService()?.isLoggedIn() != true)
+                if (full) {
+                    LogStore.i(TAG, "Accounts changed (${entries.size} logged in) — full watch resync")
+                    pushConversations()
+                } else {
+                    reportServiceList()   // rebuilds + sends KEY_SERVICES / ACTIVE / FLAGS
+                }
             } catch (e: Exception) {
                 LogStore.e(TAG, "refreshSwitcher failed", e)
             }

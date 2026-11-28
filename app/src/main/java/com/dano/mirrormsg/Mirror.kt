@@ -739,6 +739,20 @@ object Mirror {
         try { convoListFile(ctx, forKey).writeText(json) } catch (_: Exception) {}
     }
 
+    /** Forget every cached root list of one account (all its folder and guild
+     *  contexts), memory and disk. Called on logout, so a later login (maybe to
+     *  another account on the same network) never shows the old account's list. */
+    fun dropCachedConvoLists(ctx: Context, serviceId: String) {
+        val prefix = "$serviceId|"
+        convoListMem.keys.removeAll { it.startsWith(prefix) }
+        // Disk names are convoListFile(key): "<id>|<folder>|<guild>" made file-safe.
+        val safeId = prefix.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val name = Regex("^" + Regex.escape("convo_list_$safeId") + "-?\\d+_\\d*\\.json$")
+        try {
+            ctx.filesDir.listFiles()?.forEach { f -> if (name.matches(f.name)) f.delete() }
+        } catch (_: Exception) {}
+    }
+
     /** Force the next list read for the ACTIVE context to skip memory (call on
      *  new-activity events). */
     fun invalidateConvoList() { convoListMem.remove(convoCacheKey()) }
