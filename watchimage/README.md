@@ -148,9 +148,11 @@ Bit depths: `Depth1` (2 colors), `Depth2` (4 colors), `Depth4` (16 colors),
 - **Box fit** (`MaxBytes == 0`): the image is scaled to fit `MaxW × MaxH`.
 - **Budget fit** (`MaxBytes > 0`): width is capped at `MaxW`, height is sized so
   the packed image fits `MaxBytes`.
-- **Compression-aware budget fit** (`MaxBytes > 0 && CompressFit`): height is
-  sized so the image's *compressed* size fits `MaxBytes`. Because compressible
-  images shrink a lot, this sends a **much larger image** for the same memory.
+- **Compression-aware budget fit** (`MaxBytes > 0 && CompressFit`): the image
+  is sized so its *compressed* size fits `MaxBytes`, width and height scaled
+  together so it keeps its shape, and never smaller than the plain budget fit.
+  Because compressible images shrink a lot, this sends a **much larger image**
+  for the same memory.
   The compressed-size estimate is byte-exact with the row codec, so the result is
   guaranteed to fit — in a single pass, no re-encode.
 

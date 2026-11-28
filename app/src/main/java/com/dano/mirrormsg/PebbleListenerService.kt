@@ -3975,10 +3975,10 @@ class PebbleListenerService : BasePebbleListenerService() {
 
     // ---- Chat-row preview cache (see thumbCache) ------------------------------
 
-    /** The cache key of a preview: chat, media (or the inline bytes), kind, and the colour settings it was encoded under. */
+    /** The cache key of a preview: chat, media (or the inline bytes), kind, and the Pictures stop it was encoded under. */
     private fun thumbKey(convoId: String, mediaID: String, inline: String, kind: String): String {
         val src = if (mediaID.isNotEmpty()) mediaID else "i${inline.length}:${inline.hashCode()}"
-        return "$convoId|$src|$kind|${Mirror.imgThumbCap}|${Mirror.imgThumbCoverage}"
+        return "$convoId|$src|$kind|q${Mirror.imgQuality}"
     }
 
     private fun thumbHave(key: String): Boolean =
@@ -4287,7 +4287,7 @@ class PebbleListenerService : BasePebbleListenerService() {
             var bandComp: Array<RowComp>? = null
             var sendStream = pixels          // legacy single-segment stream (small / short-full)
             var restartIndex: ByteArray? = null
-            if (Mirror.imgCompress && full && imgFormat == 1) {
+            if (full && imgFormat == 1) {
                 val tight = tightRows(pixels, w, imgDepth)   // strip word-align padding
                 if (tight != null) {
                     if (banded) {
@@ -4547,9 +4547,8 @@ class PebbleListenerService : BasePebbleListenerService() {
     private val fullPrepGate = Semaphore(FULL_PREP_PARALLEL)
     private val fullPrepJobs = java.util.Collections.synchronizedList(mutableListOf<kotlinx.coroutines.Job>())
 
-    private fun fullSettings(): String =
-        "${Mirror.imgFullCap}|${Mirror.imgFullCoverage}|${Mirror.imgCompress}|${Mirror.imgDither}|" +
-        "${Mirror.imgDitherCompress}|${Mirror.imgDitherIntensity}"
+    // Every encoder setting comes from the one Pictures stop (Mirror.pushImageConfig).
+    private fun fullSettings(): String = "q${Mirror.imgQuality}"
 
     private fun fullSrc(mediaID: String, inline: String): String =
         if (mediaID.isNotEmpty()) mediaID else "i${inline.length}:${inline.hashCode()}"
