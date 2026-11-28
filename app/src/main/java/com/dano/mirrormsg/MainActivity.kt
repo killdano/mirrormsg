@@ -3061,7 +3061,8 @@ class MainActivity : Activity() {
                 Schema.KEY_OP             to PebbleDictionaryItem.Int32(Schema.OP_CONVO),
                 Schema.KEY_SERVICES       to PebbleDictionaryItem.Text(labels),
                 Schema.KEY_ACTIVE_SERVICE to PebbleDictionaryItem.Int32(activeIdx),
-                Schema.KEY_SERVICE_FLAGS  to PebbleDictionaryItem.Int32(serviceFlags)
+                Schema.KEY_SERVICE_FLAGS  to PebbleDictionaryItem.Int32(serviceFlags),
+                Schema.KEY_NEWCHAT_MASK   to PebbleDictionaryItem.Int32(Mirror.newChatMask(this, entries))
             )
             sender.sendDataToPebble(Schema.WATCH_UUID, frame, watches = null)
             LogStore.i(TAG, "Pushed service list to watch: [$labels] active=$activeIdx flags=$serviceFlags")

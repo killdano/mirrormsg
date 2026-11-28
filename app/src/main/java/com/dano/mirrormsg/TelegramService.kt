@@ -204,6 +204,16 @@ class TelegramService : MessagingService, ReactionRemover {
         return if (json.startsWith("{")) json else "{\"messages\":[]}"
     }
 
+    // ---- New chat (People.kt) -------------------------------------------------
+    // The account's Telegram contacts (the ones written to most ranked first). A
+    // person's id is their 1:1 chat's (tg:user:<id>), its address kept by the bridge.
+    override val supportsNewChat = true
+
+    override fun listPeople(): String = bridge().listPeople()
+
+    override fun openPerson(personId: String): String =
+        org.json.JSONObject().put("conversationID", personId).toString()
+
     override fun sendMessage(conversationId: String, text: String, replyToken: String): String {
         val result = try {
             bridge().sendMessage(conversationId, text)

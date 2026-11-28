@@ -270,6 +270,17 @@ object Mirror {
 
     // Beeper grouping bitmask over the entries (bit i set if entry i is a
     // Beeper-backed real account; folder sub-accounts are native Telegram, so 0).
+    /** New chat (People.kt): bit i set when switcher entry i can start a chat (an
+     *  account's own entry: not a Telegram folder or a Discord server). */
+    fun newChatMask(ctx: Context, entries: List<SwitcherEntry>): Int {
+        var mask = 0
+        entries.forEachIndexed { i, e ->
+            val ok = try { ServiceRegistry.byId(ctx, e.serviceId)?.supportsNewChat == true } catch (_: Throwable) { false }
+            if (i < 8 && ok && e.folderId == 0 && e.guildId.isEmpty()) mask = mask or (1 shl i)
+        }
+        return mask
+    }
+
     fun switcherFlags(ctx: Context, entries: List<SwitcherEntry>): Int {
         var flags = 0
         entries.forEachIndexed { i, e ->
@@ -1107,6 +1118,14 @@ object Schema {
     val KEY_REQ_REACT: UInt       = 150u // watch->phone (text): react with this emoji to
                                         // message KEY_REPLY_TO_INDEX (with KEY_REQ_HASH) of
                                         // the chat KEY_DRAFT_TOK names
+    // New chat (People.kt): the watch's switcher starts a chat with someone on an account.
+    // The people come as a list level (a BACK row above them), filtered by the screen's
+    // own draft (its token, People.TOKEN), and Select on one opens the chat with them.
+    val KEY_NEWCHAT_MASK: UInt    = 151u // phone->watch (with KEY_SERVICES): bit i set =
+                                        // switcher entry i can start chats
+    val KEY_REQ_NEWCHAT: UInt     = 152u // watch->phone: the people of switcher entry v
+    val KEY_PEOPLE: UInt          = 153u // phone->watch (every list frame of the people):
+                                        // the screen's token, which its draft ops name
     val KEY_THREAD_GREW: UInt     = 138u // phone->watch (OP_MSG of a feed, step 95): these rows
                                         // were fetched in the background and go below what
                                         // the watch holds, its view unmoved (KEY_LIST_ABS =
