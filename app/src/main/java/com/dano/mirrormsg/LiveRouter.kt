@@ -447,75 +447,162 @@ object LiveRouter {
         }
         if (ian) {
             LogStore.i(TAG, "routeIncoming: IAN convo $convoId (mode=$mode, img=$hasImage, watchOpen=$watchOpen, sameChat=$sameChatOpen, owner=$ownerServiceId)")
-            forceOpenWatch(convoId, Schema.VIEW_ENHANCED, ownerServiceId)
+            // MirrorMap or MirrorMov may be on the watch's screen. While the MirrorMsg
+            // watchapp is closed, a force-open would close that map app, so MirrorMap
+            // Dash is asked first to show the message as a card inside it (MapCard).
+            // Without a Dash that can, exactly as before.
+            if (!watchOpen && MapCard.canShow(ctx)) {
+                offerCard(ctx, convoId, sender, body, groupName, hasImage, ownerServiceId, msgId, mediaRef)
+            } else {
+                forceOpenWatch(convoId, Schema.VIEW_ENHANCED, ownerServiceId)
+            }
         } else {
             LogStore.i(TAG, "routeIncoming: pebble notification convo $convoId (mode=$mode, img=$hasImage, watchOpen=$watchOpen)")
-            // PebbleOS renders images attached to Android notifications, so a
-            // picture message must carry its picture — otherwise our notification
-            // shows "[Image]" where a Pebble-native one shows the photo, and the
-            // user's rational move is to turn MirrorMsg off.
-            //
-            // The fetch can touch the network, so it runs off-thread with a bounded
-            // wait: if the image isn't ready in time we post text-only rather than
-            // sitting on the notification. Posting late-but-with-picture is fine;
-            // never posting is not. (One post either way — a second post to update
-            // the same id would not re-alert, so Pebble would keep showing the
-            // text-only version anyway.)
-            val ref = if (hasImage) mediaRef else null
-            if (ref != null && ref.usable) {
-                CoroutineScope(Dispatchers.IO).launch {
-                    val t0 = System.currentTimeMillis()
-                    // ONE budget covers both halves — waiting for the reference and
-                    // fetching the image. Timing them separately would let a slow
-                    // message stack 4s of waiting on top of 5s of downloading, and a
-                    // notification that lands 9 seconds late is its own bug.
-                    val pic = withTimeoutOrNull(NOTIF_IMAGE_TIMEOUT_MS) {
-                        // If this stage had no downloadable reference, give the later
-                        // stage a moment to bring one; otherwise we'd notify with the
-                        // preview thumbnail and it renders as a blur.
-                        val best = if (ref.mediaId.isEmpty()) (awaitMediaRef(msgId, convoId, ref) ?: ref) else ref
-                        NotificationImages.bitmapFor(best, ownerServiceId, ctx)
-                    }
-                    val took = System.currentTimeMillis() - t0
-                    if (pic == null) {
-                        // Distinguish "timed out" from "returned nothing" — they have
-                        // completely different fixes and both used to look identical
-                        // in the log (a cancelled coroutine logs nothing at all).
-                        if (took >= NOTIF_IMAGE_TIMEOUT_MS)
-                            LogStore.w(TAG, "Notification image TIMED OUT after ${took}ms for $msgId — posting text-only")
-                        else
-                            LogStore.i(TAG, "Notification image unavailable (${took}ms) for $msgId — posting text-only")
-                    } else {
-                        LogStore.i(TAG, "Notification image ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
-                    }
-                    Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
-                    mediaRefs.remove(msgId)
+            postNotification(ctx, convoId, sender, body, groupName, hasImage, ownerServiceId, msgId, mediaRef)
+        }
+    }
+
+    /**
+     * The Pebble notification for a message: an alerting Android notification that the
+     * Pebble app mirrors (it does all the alerting; the watchapp stays passive). A
+     * picture message, or a link with a picture behind it, waits a bounded time for its
+     * picture first.
+     */
+    private fun postNotification(ctx: android.content.Context, convoId: String, sender: String, body: String,
+                                 groupName: String, hasImage: Boolean, ownerServiceId: String, msgId: String,
+                                 mediaRef: NotificationImages.Ref?) {
+        // PebbleOS renders images attached to Android notifications, so a
+        // picture message must carry its picture — otherwise our notification
+        // shows "[Image]" where a Pebble-native one shows the photo, and the
+        // user's rational move is to turn MirrorMsg off.
+        //
+        // The fetch can touch the network, so it runs off-thread with a bounded
+        // wait: if the image isn't ready in time we post text-only rather than
+        // sitting on the notification. Posting late-but-with-picture is fine;
+        // never posting is not. (One post either way — a second post to update
+        // the same id would not re-alert, so Pebble would keep showing the
+        // text-only version anyway.)
+        val ref = if (hasImage) mediaRef else null
+        if (ref != null && ref.usable) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val t0 = System.currentTimeMillis()
+                // ONE budget covers both halves — waiting for the reference and
+                // fetching the image. Timing them separately would let a slow
+                // message stack 4s of waiting on top of 5s of downloading, and a
+                // notification that lands 9 seconds late is its own bug.
+                val pic = withTimeoutOrNull(NOTIF_IMAGE_TIMEOUT_MS) {
+                    // If this stage had no downloadable reference, give the later
+                    // stage a moment to bring one; otherwise we'd notify with the
+                    // preview thumbnail and it renders as a blur.
+                    val best = if (ref.mediaId.isEmpty()) (awaitMediaRef(msgId, convoId, ref) ?: ref) else ref
+                    NotificationImages.bitmapFor(best, ownerServiceId, ctx)
                 }
-            } else if (LinkPictures.has(body)) {
-                // Step 109: a link with a picture behind it (an X / Reddit / Imgur /
-                // Instagram / Facebook post, a YouTube video, a GIF picker's link, a
-                // picture file) carries that picture too, looked up as the watch's
-                // chat would. Dan: a late notification with its picture beats a quick
-                // one without, so this waits up to LINK_IMAGE_TIMEOUT_MS.
-                CoroutineScope(Dispatchers.IO).launch {
-                    val t0 = System.currentTimeMillis()
-                    val pic = try {
-                        withTimeoutOrNull(LINK_IMAGE_TIMEOUT_MS) {
-                            LinkPictures.forText(ctx, body, LINK_IMAGE_TIMEOUT_MS - 1000L)
-                        }
-                    } catch (e: Throwable) {
-                        LogStore.w(TAG, "Link picture failed: ${e.javaClass.simpleName}")
-                        null
-                    }
-                    val took = System.currentTimeMillis() - t0
-                    if (pic == null) LogStore.i(TAG, "Link picture unavailable (${took}ms) for $msgId: posting text-only")
-                    else LogStore.i(TAG, "Link picture ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
-                    Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
+                val took = System.currentTimeMillis() - t0
+                if (pic == null) {
+                    // Distinguish "timed out" from "returned nothing" — they have
+                    // completely different fixes and both used to look identical
+                    // in the log (a cancelled coroutine logs nothing at all).
+                    if (took >= NOTIF_IMAGE_TIMEOUT_MS)
+                        LogStore.w(TAG, "Notification image TIMED OUT after ${took}ms for $msgId — posting text-only")
+                    else
+                        LogStore.i(TAG, "Notification image unavailable (${took}ms) for $msgId — posting text-only")
+                } else {
+                    LogStore.i(TAG, "Notification image ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
                 }
-            } else {
-                Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName)
+                Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
+                mediaRefs.remove(msgId)
+            }
+        } else if (LinkPictures.has(body)) {
+            // Step 109: a link with a picture behind it (an X / Reddit / Imgur /
+            // Instagram / Facebook post, a YouTube video, a GIF picker's link, a
+            // picture file) carries that picture too, looked up as the watch's
+            // chat would. Dan: a late notification with its picture beats a quick
+            // one without, so this waits up to LINK_IMAGE_TIMEOUT_MS.
+            CoroutineScope(Dispatchers.IO).launch {
+                val t0 = System.currentTimeMillis()
+                val pic = try {
+                    withTimeoutOrNull(LINK_IMAGE_TIMEOUT_MS) {
+                        LinkPictures.forText(ctx, body, LINK_IMAGE_TIMEOUT_MS - 1000L)
+                    }
+                } catch (e: Throwable) {
+                    LogStore.w(TAG, "Link picture failed: ${e.javaClass.simpleName}")
+                    null
+                }
+                val took = System.currentTimeMillis() - t0
+                if (pic == null) LogStore.i(TAG, "Link picture unavailable (${took}ms) for $msgId: posting text-only")
+                else LogStore.i(TAG, "Link picture ready in ${took}ms (${pic.width}x${pic.height}) for $msgId")
+                Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName, pic)
+            }
+        } else {
+            Notifier.postNewMessage(ctx, convoId, sender, body, ownerServiceId, msgId, groupName)
+        }
+    }
+
+    /**
+     * The force-open [routeIncoming] chose, offered to MirrorMap Dash as a message card
+     * first. Off the calling thread: Dash's answer takes up to
+     * [MapCardRules.SHOW_TIMEOUT_MS].
+     *  - shown / queued: the card is up on the map app (or will be). Done.
+     *  - not_shown: a map app is on screen but can't show cards (an older one, or a watch
+     *    without them): the Pebble notification, which shows over it without closing it.
+     *  - anything else (no map app on screen, refused, failed, no answer): force-open
+     *    exactly as before.
+     * Muted and silenced messages never get here (routeIncoming returned for them).
+     */
+    private fun offerCard(ctx: android.content.Context, convoId: String, sender: String, body: String,
+                          groupName: String, hasImage: Boolean, ownerServiceId: String, msgId: String,
+                          mediaRef: NotificationImages.Ref?) {
+        // This may still become a force-open, so the convo's debounced repaint is held
+        // off from now, as forceOpenWatch does (armed before the coroutine; see there),
+        // over the whole exchange. A force-open re-arms it for itself; otherwise only
+        // this window is lifted when Dash has answered.
+        val quiet = System.currentTimeMillis() + MapCardRules.SHOW_TIMEOUT_MS + FORCE_OPEN_QUIET_MS
+        Mirror.forceOpenQuietUntil[convoId] = quiet
+        val token = MapCard.tokens.add(convoId, ownerServiceId)
+        // The card shows who it's from; with no name, the network's.
+        val name = sender.ifBlank { ServiceRegistry.byId(ctx, ownerServiceId)?.displayName.orEmpty() }
+        // The watch buzzes for a card as for the force-open it replaces: that always
+        // buzzes once routeIncoming gets this far (the watch itself skips it in Quiet
+        // Time), so nothing here turns it off.
+        val buzz = true
+        LogStore.i(TAG, "routeIncoming: card $token offered to Dash (owner=$ownerServiceId, img=$hasImage)")
+        CoroutineScope(Dispatchers.IO).launch {
+            val result = try {
+                MapCard.show(ctx, token, name, body, MapCardRules.colorFor(ownerServiceId), buzz)
+            } catch (e: Exception) {
+                LogStore.w(TAG, "Card $token failed: ${e.javaClass.simpleName}")
+                MapCardRules.RESULT_FAILED
+            }
+            when (MapCardRules.actionFor(result)) {
+                MapCardRules.Action.DONE -> liftQuiet(convoId, quiet)
+                MapCardRules.Action.NOTIFY -> {
+                    liftQuiet(convoId, quiet)
+                    LogStore.i(TAG, "Card $token not shown: pebble notification instead")
+                    postNotification(ctx, convoId, sender, body, groupName, hasImage, ownerServiceId, msgId, mediaRef)
+                }
+                MapCardRules.Action.FORCE_OPEN -> {
+                    LogStore.i(TAG, "Card $token: ${MapCardRules.logWord(result)}, force-open instead")
+                    forceOpenWatch(convoId, Schema.VIEW_ENHANCED, ownerServiceId)
+                }
             }
         }
+    }
+
+    /** Lifts the repaint hold [offerCard] armed, unless a force-open has re-armed it since. */
+    private fun liftQuiet(convoId: String, armed: Long) {
+        val m = Mirror.forceOpenQuietUntil
+        synchronized(m) { if (m[convoId] == armed) m[convoId] = 0L }
+    }
+
+    /**
+     * A message card on a map app was tapped (MapCard, Dash's "opened"): open that chat
+     * in the MirrorMsg watchapp as a force-open does, on the chat view. With the map app
+     * known ([app]), Back from that chat brings it back (MapCard.onThreadClosed).
+     */
+    fun openFromCard(convoId: String, ownerServiceId: String, app: String?) {
+        LogStore.i(TAG, "Card opened: opening the chat on the watch (owner=$ownerServiceId, from=${app ?: "?"})")
+        forceOpenWatch(convoId, Schema.VIEW_CHAT, ownerServiceId)
+        if (app != null) MapCard.markReturn(convoId, app)
     }
 
     // Serializes IAN sequences. A burst of notify-worthy messages fires one
@@ -648,6 +735,8 @@ object LiveRouter {
     private fun forceOpenWatch(convoId: String, openView: Int = Schema.VIEW_CHAT,
                                ownerServiceId: String = Mirror.activeServiceId) {
         val ctx = Mirror.appContext ?: return
+        // Another chat taking the screen ends a "back to the map" return (MapCard).
+        MapCard.onForceOpen(convoId)
         // Arm the repaint suppression BEFORE launching the coroutine, so a repaint
         // debounce started by this same message can't slip through the gap.
         Mirror.forceOpenQuietUntil[convoId] = System.currentTimeMillis() + FORCE_OPEN_QUIET_MS

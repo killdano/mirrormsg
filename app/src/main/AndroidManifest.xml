@@ -73,8 +73,9 @@
              as a belt-and-suspenders alongside the package entry. -->
         <package android:name="com.beeper.android" />
         <provider android:authorities="com.beeper.api" />
-        <!-- MirrorMap Dash: the only caller of the Dash Cam picker and send service;
-             its signing certificate is checked (CamCallers). -->
+        <!-- MirrorMap Dash: the only caller of the Dash Cam picker and send service,
+             and the message card service MirrorMsg binds (MapCard); its signing
+             certificate is checked (CamCallers). -->
         <package android:name="com.mirrormap.dash" />
     </queries>
 
