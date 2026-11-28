@@ -1802,12 +1802,29 @@ class PebbleListenerService : BasePebbleListenerService() {
             streamConvoSpan(json, 0, total)
             val pnRow = Mirror.convoOrder.indexOf(convoId)   // -1: a new chat, not listed yet
             if (pnRow >= 0) Mirror.currentOpenRoute = Mirror.currentOpenRoute ?: Mirror.simRoutes.getOrNull(pnRow)
-            streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
-            pushDraft(convoId)
-            val f = svc.fetchMessages(convoId, FETCH_COUNT, "")
-            val added = MessageStore.merge(this, convoId, JSONObject(f).optJSONArray("messages") ?: JSONArray())
-            if (added > 0 && Mirror.currentOpenConvoId == convoId)
+            // What the phone holds of the chat shows at once. A chat it holds none of (an
+            // older one never opened here) waits for the network's messages instead, so
+            // someone you already talk to never opens as an empty chat first, or stays one
+            // when the fetch fails. One the network has none of either is the new chat.
+            val hasStored = MessageStore.load(this, convoId).length() > 0
+            if (hasStored) {
                 streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+                pushDraft(convoId)
+            }
+            val t1 = System.currentTimeMillis()
+            val added = try {
+                val f = svc.fetchMessages(convoId, FETCH_COUNT, "")
+                MessageStore.merge(this, convoId, JSONObject(f).optJSONArray("messages") ?: JSONArray())
+            } catch (e: Exception) {
+                LogStore.w(TAG, "New chat: the chat's messages didn't come (${e.message?.take(120)})")
+                0
+            }
+            LogStore.i(TAG, "New chat: ${if (hasStored) "stored" else "none stored"}, catch-up added $added " +
+                "in ${System.currentTimeMillis() - t1} ms")
+            if ((added > 0 || !hasStored) && Mirror.currentOpenConvoId == convoId) {
+                streamMessages(convoId, MessageStore.loadAsThreadJson(this, convoId), pnRow = pnRow)
+                if (!hasStored) pushDraft(convoId)
+            }
         } catch (e: Exception) {
             LogStore.w(TAG, "New chat: the chat's messages didn't come (${e.message?.take(120)})")
         }
